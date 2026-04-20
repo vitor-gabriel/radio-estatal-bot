@@ -9,13 +9,16 @@ set "PATH=C:\Users\Vitor\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Mic
 :start
 set "PYTHONPATH=%CD%"
 
-if not exist ".venv\Scripts\python.exe" (
-    echo [INFO] Criando ambiente virtual com Python 3.12...
-    "%PYTHON%" -m venv .venv
-    if errorlevel 1 (
-        echo [ERRO] Falha ao criar a .venv.
-        exit /b 1
-    )
+if exist ".venv" (
+    echo [INFO] Removendo .venv anterior...
+    rmdir /s /q ".venv"
+)
+
+echo [INFO] Criando ambiente virtual com Python 3.12...
+"%PYTHON%" -m venv .venv
+if errorlevel 1 (
+    echo [ERRO] Falha ao criar a .venv.
+    exit /b 1
 )
 
 call ".venv\Scripts\activate.bat"

@@ -36,6 +36,7 @@ MAX_RECENT_TITLES = 12
 MAX_RECENT_UPLOADERS = 6
 manual_stop_guilds = set()
 _ytmusic_client = None
+_lastfm_artist_tags_cache = {}
 
 
 def _normalizar_candidato_youtube(candidate):
@@ -451,6 +452,84 @@ def _inferir_artista_para_recomendacao(selected_entry: dict, entries: list, user
     return ""
 
 
+def _normalizar_tag(value: str) -> str:
+    return re.sub(r"[^a-z0-9\s]", "", _normalizar_texto(value))
+
+
+def _buscar_tags_artista_lastfm(artist: str, limit: int = 8) -> set[str]:
+    """Retorna tags principais de um artista no Last.fm com cache simples em memória."""
+    artist_norm = _normalizar_texto(artist)
+    if not LASTFM_API_KEY or not artist_norm:
+        return set()
+
+    if artist_norm in _lastfm_artist_tags_cache:
+        return _lastfm_artist_tags_cache[artist_norm]
+
+    try:
+        resp = requests.get(LASTFM_API_URL, params={
+            'method': 'artist.getTopTags',
+            'artist': artist,
+            'api_key': LASTFM_API_KEY,
+            'format': 'json',
+        }, timeout=5)
+        resp.raise_for_status()
+        data = resp.json()
+        tags = data.get('toptags', {}).get('tag', [])
+        parsed = set()
+        for tag in tags[:limit]:
+            name = _normalizar_tag(tag.get('name') or '')
+            if name:
+                parsed.add(name)
+        _lastfm_artist_tags_cache[artist_norm] = parsed
+        return parsed
+    except Exception as e:
+        logging.warning(f"[Last.fm] Falha ao buscar tags do artista '{artist}': {e}")
+        _lastfm_artist_tags_cache[artist_norm] = set()
+        return set()
+
+
+def _filtrar_similares_por_tematica(seed_artist: str, similar_tracks: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Filtra similares fora do estilo dominante do artista base (ex.: rock -> evita kpop)."""
+    if not similar_tracks or not seed_artist or not LASTFM_API_KEY:
+        return similar_tracks
+
+    seed_tags = _buscar_tags_artista_lastfm(seed_artist)
+    if not seed_tags:
+        return similar_tracks
+
+    themed = []
+    fallback = []
+
+    seed_has_rock = any(t in seed_tags for t in ('rock', 'alternative rock', 'metal', 'nu metal', 'hard rock'))
+    seed_has_pop = any(t in seed_tags for t in ('pop', 'dance pop', 'electropop'))
+
+    for sim_artist, sim_track in similar_tracks:
+        sim_tags = _buscar_tags_artista_lastfm(sim_artist)
+        if not sim_tags:
+            fallback.append((sim_artist, sim_track))
+            continue
+
+        inter = seed_tags.intersection(sim_tags)
+
+        # Se origem é rock/metal, remove explicitamente candidatos de kpop/jpop quando sem interseção.
+        if seed_has_rock:
+            if any(t in sim_tags for t in ('kpop', 'k-pop', 'jpop', 'j-pop')) and not inter:
+                continue
+
+        # Se origem é pop, remove extremos de metal sem interseção.
+        if seed_has_pop:
+            if any(t in sim_tags for t in ('death metal', 'black metal', 'grindcore')) and not inter:
+                continue
+
+        if inter:
+            themed.append((sim_artist, sim_track))
+        else:
+            fallback.append((sim_artist, sim_track))
+
+    # Prefere manter temática; se não houver nenhum overlap, volta para lista original.
+    return themed if themed else similar_tracks
+
+
 def _buscar_similar_lastfm(track_title: str, artist: str, limit: int = 20) -> list[tuple[str, str]]:
     """Chama Last.fm track.getSimilar e retorna lista de (artista, titulo)."""
     if not LASTFM_API_KEY or not track_title or not artist:
@@ -632,6 +711,7 @@ async def buscar_recomendacao_autoplay(guild_id, ctx=None):
     if LASTFM_API_KEY:
         logging.info(f"[Last.fm] Iniciando busca de similares para guild {guild_id} — title='{title}', artist='{artist_clean}'")
         similar_tracks = await asyncio.to_thread(_buscar_similar_lastfm, title, artist_clean)
+        similar_tracks = await asyncio.to_thread(_filtrar_similares_por_tematica, artist_clean, similar_tracks)
         random.shuffle(similar_tracks)
         logging.info(f"[Last.fm] {len(similar_tracks)} faixas similares retornadas, testando as 10 primeiras")
         for sim_artist, sim_track in similar_tracks[:10]:
@@ -677,7 +757,7 @@ async def tocar_proxima_musica(vc, guild_id, ctx):
         play_queue[guild_id] = deque()
 
     if not play_queue[guild_id]:
-        if autoplay_enabled.get(guild_id, False):
+        if autoplay_enabled.get(guild_id, True):
             next_url, next_title = await buscar_recomendacao_autoplay(guild_id, ctx)
             if next_url:
                 logging.info(f"Fila vazia. Adicionando música recomendada: {next_url}")
@@ -805,6 +885,7 @@ class MusicCommands(commands.Cog):
 
             if LASTFM_API_KEY:
                 similar_tracks = await asyncio.to_thread(_buscar_similar_lastfm, selected_title, artist_clean, limit=10)
+                similar_tracks = await asyncio.to_thread(_filtrar_similares_por_tematica, artist_clean, similar_tracks)
                 for sim_artist, sim_track in similar_tracks:
                     display = f"{sim_artist} - {sim_track}"
                     if any(_titulo_equivalente(sim_track, seen) for seen in seen_related_titles):
@@ -966,7 +1047,7 @@ class MusicCommands(commands.Cog):
             return
 
         guild_id = ctx.guild.id
-        status = autoplay_enabled.get(guild_id, False)
+        status = autoplay_enabled.get(guild_id, True)
 
         if mode is None or mode.lower() == 'status':
             await ctx.send(f"Auto-play está **{'ativado' if status else 'desativado'}** neste servidor.")
