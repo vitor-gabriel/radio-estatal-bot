@@ -18,6 +18,9 @@ DATABASE_NAME = os.getenv('DATABASE_NAME', 'noobsquad_bot')
 # YouTube API
 YOUTUBE_API_KEY = os.getenv('YOUTUBE_API_KEY')
 
+# Last.fm API (https://www.last.fm/api/account/create)
+LASTFM_API_KEY = os.getenv('LASTFM_API_KEY')
+
 # Twitch API
 TWITCH_CLIENT_ID = os.getenv('TWITCH_CLIENT_ID')
 TWITCH_CLIENT_SECRET = os.getenv('TWITCH_CLIENT_SECRET')

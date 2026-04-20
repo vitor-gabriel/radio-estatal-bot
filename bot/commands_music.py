@@ -7,13 +7,16 @@ import random
 import difflib
 import re
 import urllib.parse
+import requests
 from collections import deque
 
 from db.database import db
-from config.settings import EQUALIZER_PRESETS
+from config.settings import EQUALIZER_PRESETS, LASTFM_API_KEY
 from .utils import clean_youtube_url, is_youtube_url, stream_musica
 from .commands_utils import validar_canal, play_queue, last_played_info, autoplay_enabled, active_preset
 
+
+LASTFM_API_URL = "https://ws.audioscrobbler.com/2.0/"
 
 MAX_AUTOPLAY_RECENTES = 20
 autoplay_recent_urls = {}
@@ -284,6 +287,43 @@ def _escolher_candidato_diverso(
     return None, None
 
 
+def _limpar_nome_artista(uploader: str) -> str:
+    """Remove sufixos do YouTube Music como ' - Topic' e ' VEVO'."""
+    if not uploader:
+        return ""
+    uploader = re.sub(r'\s*-\s*Topic\s*$', '', uploader, flags=re.IGNORECASE)
+    uploader = re.sub(r'\s*VEVO\s*$', '', uploader, flags=re.IGNORECASE)
+    return uploader.strip()
+
+
+def _buscar_similar_lastfm(track_title: str, artist: str, limit: int = 20) -> list[tuple[str, str]]:
+    """Chama Last.fm track.getSimilar e retorna lista de (artista, titulo)."""
+    if not LASTFM_API_KEY or not track_title or not artist:
+        return []
+    try:
+        resp = requests.get(LASTFM_API_URL, params={
+            'method': 'track.getSimilar',
+            'track': track_title,
+            'artist': artist,
+            'api_key': LASTFM_API_KEY,
+            'format': 'json',
+            'limit': limit,
+        }, timeout=5)
+        resp.raise_for_status()
+        data = resp.json()
+        tracks = data.get('similartracks', {}).get('track', [])
+        results = []
+        for t in tracks:
+            t_name = (t.get('name') or '').strip()
+            t_artist = (t.get('artist', {}).get('name') or '').strip()
+            if t_name and t_artist:
+                results.append((t_artist, t_name))
+        return results
+    except Exception as e:
+        logging.warning(f"Falha ao buscar similares no Last.fm: {e}")
+        return []
+
+
 async def buscar_recomendacao_autoplay(guild_id, ctx=None):
     """Busca uma URL recomendada para autoplay com fallback por pesquisa."""
     info = last_played_info.get(guild_id) or {}
@@ -377,6 +417,7 @@ async def buscar_recomendacao_autoplay(guild_id, ctx=None):
 
     title = last_title.strip()
     uploader = (info.get('uploader', '') or '').strip()
+    artist_clean = _limpar_nome_artista(uploader) or title.split('-')[0].strip()
 
     async def buscar_por_query(query_text: str, max_results: int = 10):
         if not query_text:
@@ -414,25 +455,29 @@ async def buscar_recomendacao_autoplay(guild_id, ctx=None):
 
         return None, None
 
-    # 1) Busca principal: título + uploader
-    main_query = " ".join(part for part in (title, uploader) if part)
-    chosen_url, chosen_title = await buscar_por_query(main_query, max_results=10)
-    if chosen_url:
-        return chosen_url, chosen_title
+    # 1) Last.fm: músicas similares de verdade (artistas diferentes)
+    if LASTFM_API_KEY:
+        similar_tracks = await asyncio.to_thread(_buscar_similar_lastfm, title, artist_clean)
+        random.shuffle(similar_tracks)
+        for sim_artist, sim_track in similar_tracks[:10]:
+            query = f"{sim_artist} {sim_track}"
+            chosen_url, chosen_title = await buscar_por_query(query, max_results=5)
+            if chosen_url:
+                return chosen_url, chosen_title
 
-    # 2) Fallback: apenas uploader/canal para aumentar variedade de faixas
-    uploader_only = _normalizar_texto(uploader)
+    # 2) Busca por outros títulos do mesmo artista (evita recomenda o mesmo título)
+    uploader_only = _limpar_nome_artista(uploader) or _normalizar_texto(uploader)
     chosen_url, chosen_title = await buscar_por_query(uploader_only, max_results=20)
     if chosen_url:
         return chosen_url, chosen_title
 
-    # 2.5) Fallback adicional: artistas recentes do MongoDB
+    # 3) Fallback: artistas recentes do MongoDB
     for artist_hint in mongo_artist_hints:
         chosen_url, chosen_title = await buscar_por_query(f"{artist_hint} official", max_results=20)
         if chosen_url:
             return chosen_url, chosen_title
 
-    # 3) Fallback extra: parte antes de '-' (muitas vezes artista) + "official"
+    # 4) Fallback final: artista extraído do título + "official"
     artista_hint = title.split('-')[0].strip() if '-' in title else ""
     extra_query = f"{artista_hint} official".strip()
     chosen_url, chosen_title = await buscar_por_query(extra_query, max_results=25)
