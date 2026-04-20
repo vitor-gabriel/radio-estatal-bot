@@ -12,3 +12,4 @@ def validar_canal(ctx):
 play_queue = {}
 last_played_info = {}
 autoplay_enabled = {}
+active_preset = {}

@@ -43,7 +43,7 @@ SYNC_MEMBERS_HOUR, SYNC_MEMBERS_MINUTE = parse_sync_time(SYNC_MEMBERS_TIME)
 # Equalizer presets
 EQUALIZER_PRESETS = {
     "padrao": '-filter_complex "equalizer=f=5000:g=2:w=1,equalizer=f=8000:g=2:w=1"',
+    "bassboost": '-filter_complex "equalizer=f=60:g=7:w=1:t=h,equalizer=f=120:g=5:w=1:t=h,equalizer=f=250:g=3:w=1:t=h"',
     "pop": '-filter_complex "equalizer=f=80:g=4:w=1:t=h,equalizer=f=8000:g=4:w=1:t=h"',
-    "rock": '-filter_complex "equalizer=f=120:g=-2:w=1:t=h,equalizer=f=2000:g=3:w=1:t=h,equalizer=f=5000:g=4:w=1:t=h"',
-    "graves": '-filter_complex "equalizer=f=80:g=4:w=1:t=h,equalizer=f=200:g=2:w=1:t=h"',
+    "rock": '-filter_complex "equalizer=f=120:g=-2:w=1:t=h,equalizer=f=2000:g=3:w=1:t=h,equalizer=f=5000:g=4:w=1:t=h"'
 }

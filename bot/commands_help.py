@@ -18,7 +18,9 @@ class HelpCommands(commands.Cog):
         embed.add_field(
             name="Comandos de Música",
             value="""
-                `!play <url> [autoplay]` - Toca uma música do YouTube ou adiciona à fila
+                `!play <url>` - Toca uma música do YouTube ou adiciona à fila
+                `!preset [padrao|bassboost|pop|rock|status]` - Alterna o preset de equalização
+                `!autoplay [on|off|status]` - Controla a reprodução automática de recomendadas
                 `!skip` - Pula para a próxima música
                 `!stop` - Para a música e limpa a fila
                 `!leave` - Faz o bot sair do canal de voz

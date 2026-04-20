@@ -6,33 +6,116 @@ import asyncio
 from collections import deque
 
 from db.database import db
+from config.settings import EQUALIZER_PRESETS
 from .utils import clean_youtube_url, is_youtube_url, stream_musica
-from .commands_utils import validar_canal, play_queue, last_played_info, autoplay_enabled
+from .commands_utils import validar_canal, play_queue, last_played_info, autoplay_enabled, active_preset
+
+
+def _normalizar_candidato_youtube(candidate):
+    """Converte diferentes formatos de identificador para URL válida do YouTube."""
+    if not candidate:
+        return None
+
+    value = str(candidate).strip()
+    if not value:
+        return None
+
+    if value.startswith('http://') or value.startswith('https://'):
+        try:
+            cleaned = clean_youtube_url(value)
+        except Exception:
+            return None
+        return cleaned if is_youtube_url(cleaned) else None
+
+    # yt_dlp pode retornar apenas o id do vídeo em alguns cenários (extract_flat).
+    if len(value) == 11 and '/' not in value and '?' not in value:
+        cleaned = clean_youtube_url(f"https://www.youtube.com/watch?v={value}")
+        return cleaned if is_youtube_url(cleaned) else None
+
+    return None
+
+
+async def buscar_recomendacao_autoplay(guild_id):
+    """Busca uma URL recomendada para autoplay com fallback por pesquisa."""
+    info = last_played_info.get(guild_id) or {}
+    queue_urls = set()
+
+    for entry in play_queue.get(guild_id, []):
+        try:
+            queue_urls.add(clean_youtube_url(entry[0]))
+        except Exception:
+            continue
+
+    current_url = _normalizar_candidato_youtube(
+        info.get('webpage_url') or info.get('original_url') or info.get('requested_url')
+    )
+    if current_url:
+        queue_urls.add(current_url)
+
+    def pick_url(entry):
+        if not isinstance(entry, dict):
+            return None
+
+        for key in ('url', 'webpage_url', 'original_url', 'id'):
+            normalized = _normalizar_candidato_youtube(entry.get(key))
+            if normalized and normalized not in queue_urls:
+                return normalized, entry.get('title', 'Desconhecido')
+        return None
+
+    related_videos = info.get('related_videos') or []
+    if isinstance(related_videos, list):
+        for video in related_videos:
+            picked = pick_url(video)
+            if picked:
+                return picked
+
+    title = info.get('title', '').strip()
+    uploader = info.get('uploader', '').strip()
+    query = " ".join(part for part in (title, uploader) if part)
+    if not query:
+        return None, None
+
+    try:
+        with yt_dlp.YoutubeDL({
+            'quiet': True,
+            'extract_flat': True,
+            'default_search': 'ytsearch10'
+        }) as ydl:
+            result = await asyncio.to_thread(
+                ydl.extract_info,
+                f"ytsearch10:{query.replace('&', 'and')}",
+                download=False
+            )
+
+        if result and 'entries' in result:
+            for entry in result['entries']:
+                picked = pick_url(entry)
+                if picked:
+                    return picked
+    except Exception as e:
+        logging.warning(f"Falha ao buscar fallback de autoplay para guild {guild_id}: {e}")
+
+    return None, None
 
 
 async def tocar_proxima_musica(vc, guild_id, ctx):
     """Toca a próxima música da fila ou busca uma recomendada se auto-play estiver ativo."""
-    if guild_id not in play_queue or not play_queue[guild_id]:
+    if guild_id not in play_queue:
+        play_queue[guild_id] = deque()
+
+    if not play_queue[guild_id]:
         if autoplay_enabled.get(guild_id, False):
-            if guild_id in last_played_info and 'related_videos' in last_played_info[guild_id]:
-                related_videos = last_played_info[guild_id]['related_videos']
-
-                next_url = None
-                for video in related_videos:
-                    if video.get('url') and is_youtube_url(video['url']):
-                        next_url = video['url']
-                        break
-
-                if next_url:
-                    logging.info(f"Fila vazia. Adicionando música recomendada: {next_url}")
-                    await ctx.send(f"Fila vazia. Reproduzindo uma música recomendada.")
-                    play_queue[guild_id].append((next_url, "padrao"))
+            next_url, next_title = await buscar_recomendacao_autoplay(guild_id)
+            if next_url:
+                logging.info(f"Fila vazia. Adicionando música recomendada: {next_url}")
+                preset_name = active_preset.get(guild_id, 'padrao')
+                play_queue[guild_id].append((next_url, preset_name))
+                if next_title:
+                    await ctx.send(f"Fila vazia. Auto-play escolheu: **{next_title}**")
                 else:
-                    await ctx.send("Nenhuma música recomendada encontrada. A reprodução parou.")
-                    await vc.disconnect()
-                    return
+                    await ctx.send("Fila vazia. Reproduzindo uma música recomendada.")
             else:
-                await ctx.send("A fila de músicas está vazia e não há recomendações. A reprodução parou.")
+                await ctx.send("A fila de músicas está vazia e não há recomendações para o auto-play. A reprodução parou.")
                 await vc.disconnect()
                 return
         else:
@@ -44,7 +127,9 @@ async def tocar_proxima_musica(vc, guild_id, ctx):
     source, stream_title, info = await stream_musica(url, preset_name)
 
     if source:
-        last_played_info[guild_id] = info
+        track_info = info or {}
+        track_info['requested_url'] = url
+        last_played_info[guild_id] = track_info
         try:
             vc.play(source, after=lambda e: asyncio.run_coroutine_threadsafe(
                 tocar_proxima_musica(vc, guild_id, ctx), ctx.bot.loop))
@@ -63,9 +148,9 @@ class MusicCommands(commands.Cog):
         self.bot = bot
 
     @commands.command(name='play')
-    async def play(self, ctx, url: str = None, *args):
+    async def play(self, ctx, url: str = None):
         """Toca uma música ou adiciona à fila
-        Uso: !play <url> [autoplay]"""
+        Uso: !play <url>"""
         # 1. Validar canal correto
         if not validar_canal(ctx):
             await ctx.send("O Animal, Use o canal JUKEBOX para comandos de música.")
@@ -73,7 +158,7 @@ class MusicCommands(commands.Cog):
 
         # 2. Validar se a URL foi fornecida
         if not url:
-            await ctx.send("Ei! Você precisa me dar uma URL do YouTube. Uso correto: `!play <url> [autoplay]`")
+            await ctx.send("Ei! Você precisa me dar uma URL do YouTube. Uso correto: `!play <url>`")
             return
 
         # 3. Validar se está em um canal de voz
@@ -95,10 +180,7 @@ class MusicCommands(commands.Cog):
         else:
             vc = ctx.guild.voice_client
 
-        preset_name = "padrao"
-        if 'autoplay' in args:
-            autoplay_enabled[guild_id] = True
-            args = [a for a in args if a != 'autoplay']
+        preset_name = active_preset.get(guild_id, 'padrao')
 
         cleaned_url = clean_youtube_url(url)
         if not is_youtube_url(cleaned_url):
@@ -163,10 +245,75 @@ class MusicCommands(commands.Cog):
             guild_id = ctx.guild.id
             if guild_id in play_queue:
                 play_queue[guild_id].clear()
+            autoplay_enabled.pop(guild_id, None)
+            last_played_info.pop(guild_id, None)
+            active_preset.pop(guild_id, None)
             await ctx.guild.voice_client.disconnect()
             await ctx.send("Desconectado do canal de voz.")
         else:
             await ctx.send("Não estou em nenhum canal de voz.")
+
+    @commands.command(name='preset')
+    async def preset(self, ctx, mode: str = None):
+        """Controla o preset da equalização: padrao ou bassbost.
+
+        Uso: !preset [padrao|bassbost|status]
+        """
+        if not validar_canal(ctx):
+            await ctx.send("O Animal, Use o canal JUKEBOX para comandos de música.")
+            return
+
+        guild_id = ctx.guild.id
+        current = active_preset.get(guild_id, 'padrao')
+
+        if mode is None or mode.lower() == 'status':
+            await ctx.send(f"Preset atual: **{current}**")
+            return
+
+        mode = mode.lower()
+        if mode == 'bassboost':
+            mode = 'bassbost'
+
+        if mode not in ('padrao', 'bassbost'):
+            await ctx.send("Uso inválido. Use `!preset padrao`, `!preset bassbost` ou `!preset status`.")
+            return
+
+        if mode not in EQUALIZER_PRESETS:
+            await ctx.send(f"Preset `{mode}` não está configurado no bot.")
+            return
+
+        active_preset[guild_id] = mode
+        await ctx.send(f"Preset alterado para **{mode}**. Novas músicas usarão esse preset.")
+
+    @commands.command(name='autoplay')
+    async def autoplay(self, ctx, mode: str = None):
+        """Controla o auto-play: on, off ou status.
+
+        Uso: !autoplay [on|off|status]
+        """
+        if not validar_canal(ctx):
+            await ctx.send("O Animal, Use o canal JUKEBOX para comandos de música.")
+            return
+
+        guild_id = ctx.guild.id
+        status = autoplay_enabled.get(guild_id, False)
+
+        if mode is None or mode.lower() == 'status':
+            await ctx.send(f"Auto-play está **{'ativado' if status else 'desativado'}** neste servidor.")
+            return
+
+        mode = mode.lower()
+        if mode in ('on', 'ligar', 'ativar', 'true', '1'):
+            autoplay_enabled[guild_id] = True
+            await ctx.send("Auto-play ativado.")
+            return
+
+        if mode in ('off', 'desligar', 'desativar', 'false', '0'):
+            autoplay_enabled[guild_id] = False
+            await ctx.send("Auto-play desativado.")
+            return
+
+        await ctx.send("Uso inválido. Use `!autoplay on`, `!autoplay off` ou `!autoplay status`.")
 
     @commands.command(name='profile')
     async def profile(self, ctx):
@@ -385,15 +532,16 @@ class MusicCommands(commands.Cog):
 
         # Inserir na fila conforme modo
         added_count = 0
+        preset_name = active_preset.get(guild_id, 'padrao')
         if append_mode:
             for (u, t) in candidates:
-                play_queue[guild_id].append((u, 'padrao'))
+                play_queue[guild_id].append((u, preset_name))
                 added_count += 1
         else:
             # inserir para tocar em seguida: percorre em ordem cronológica e appendleft
             # candidates are in chronological order because songs were iterated that way
             for (u, t) in candidates:
-                play_queue[guild_id].appendleft((u, 'padrao'))
+                play_queue[guild_id].appendleft((u, preset_name))
                 added_count += 1
 
         await ctx.send(f'✅ Adicionados {added_count} músicas do seu histórico à fila.' + (
