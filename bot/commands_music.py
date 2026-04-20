@@ -37,6 +37,22 @@ MAX_RECENT_UPLOADERS = 6
 manual_stop_guilds = set()
 _ytmusic_client = None
 _lastfm_artist_tags_cache = {}
+MAX_SANITIZED_TEXT_LEN = 256
+ENTRY_URL_KEYS = ('url', 'webpage_url', 'original_url', 'id')
+ENTRY_ARTIST_KEYS = ('uploader', 'channel', 'channel_name', 'artist')
+ENTRY_ARTIST_KEYS_LIGHT = ('uploader', 'channel', 'artist')
+
+
+def _sanitizar_texto_bruto(value, max_len: int = MAX_SANITIZED_TEXT_LEN) -> str:
+    """Sanitiza texto externo removendo caracteres de controle e limitando tamanho."""
+    if value is None:
+        return ""
+    text = str(value)
+    text = re.sub(r"[\x00-\x1f\x7f]", " ", text)
+    text = " ".join(text.split())
+    if max_len > 0 and len(text) > max_len:
+        text = text[:max_len].rstrip()
+    return text
 
 
 def _normalizar_candidato_youtube(candidate):
@@ -94,7 +110,29 @@ def _normalizar_candidato_youtube(candidate):
 def _normalizar_texto(value: str) -> str:
     if not value:
         return ""
-    return " ".join(str(value).lower().split())
+    return _sanitizar_texto_bruto(value).lower()
+
+
+def _entry_title(entry: dict) -> str:
+    if not isinstance(entry, dict):
+        return ""
+    return (entry.get('title') or '').strip()
+
+
+def _entry_artist(entry: dict, keys=ENTRY_ARTIST_KEYS, normalize: bool = False) -> str:
+    if not isinstance(entry, dict):
+        return ""
+
+    value = ''
+    for key in keys:
+        candidate = entry.get(key)
+        if candidate:
+            value = str(candidate).strip()
+            break
+
+    if normalize:
+        return _normalizar_texto(value)
+    return value
 
 
 def _titulo_canonico(title: str) -> str:
@@ -213,16 +251,14 @@ def _texto_parecido(a: str, b: str) -> bool:
 
 
 def _uploader_entry(entry: dict) -> str:
-    return _normalizar_texto(
-        entry.get('uploader') or entry.get('channel') or entry.get('channel_name') or entry.get('artist')
-    )
+    return _entry_artist(entry, keys=ENTRY_ARTIST_KEYS, normalize=True)
 
 
 def _entry_to_youtube_url(entry: dict):
     if not isinstance(entry, dict):
         return None
 
-    for key in ('url', 'webpage_url', 'original_url', 'id'):
+    for key in ENTRY_URL_KEYS:
         normalized = _normalizar_candidato_youtube(entry.get(key))
         if normalized:
             return normalized
@@ -245,7 +281,7 @@ def _get_ytmusic_client():
 
 async def _buscar_recomendacoes_musicais(query: str, max_results: int = 10, artist_hint: str = ""):
     """Busca recomendações priorizando o catálogo de músicas do YouTube Music."""
-    q = (query or '').strip()
+    q = _sanitizar_texto_bruto(query, max_len=160)
     if not q:
         return []
 
@@ -255,15 +291,15 @@ async def _buscar_recomendacoes_musicais(query: str, max_results: int = 10, arti
             results = await asyncio.to_thread(client.search, q, filter="songs", limit=max_results)
             entries = []
             for item in results or []:
-                video_id = (item.get('videoId') or '').strip()
-                title = (item.get('title') or '').strip()
+                video_id = _sanitizar_texto_bruto(item.get('videoId'), max_len=32)
+                title = _sanitizar_texto_bruto(item.get('title'))
                 if not video_id or not title or _parece_conteudo_nao_musical(title):
                     continue
 
                 artists = item.get('artists') or []
                 artist_name = ''
                 if artists and isinstance(artists, list):
-                    artist_name = (artists[0].get('name') or '').strip()
+                    artist_name = _sanitizar_texto_bruto(artists[0].get('name'))
 
                 entries.append({
                     'url': f"https://www.youtube.com/watch?v={video_id}",
@@ -281,10 +317,10 @@ async def _buscar_recomendacoes_musicais(query: str, max_results: int = 10, arti
     hint = _normalizar_texto(artist_hint)
     entries = []
     for item in raw_entries:
-        title = (item.get('title') or '').strip()
+        title = _entry_title(item)
         if not title or _parece_conteudo_nao_musical(title):
             continue
-        uploader = item.get('uploader') or item.get('channel') or item.get('artist') or ''
+        uploader = _entry_artist(item, keys=ENTRY_ARTIST_KEYS_LIGHT)
 
         # No fallback via yt_dlp, seja bem mais rígido para evitar lixo de busca.
         # Aceita se: tem marcador musical OU canal parecido com artista sugerido.
@@ -308,7 +344,7 @@ async def _buscar_recomendacoes_musicais(query: str, max_results: int = 10, arti
 
 async def _buscar_musica_ou_artista(query: str, max_results: int = 10):
     """Busca músicas por texto (artista/música) e retorna entradas do yt_dlp."""
-    q = (query or '').strip()
+    q = _sanitizar_texto_bruto(query, max_len=160)
     if not q:
         return []
 
@@ -427,7 +463,7 @@ def _limpar_nome_artista(uploader: str) -> str:
 def _inferir_artista_para_recomendacao(selected_entry: dict, entries: list, user_query: str = "") -> str:
     """Tenta inferir artista para melhorar qualidade das recomendações."""
     if isinstance(selected_entry, dict):
-        direct = selected_entry.get('uploader') or selected_entry.get('channel') or selected_entry.get('artist')
+        direct = _entry_artist(selected_entry, keys=ENTRY_ARTIST_KEYS_LIGHT)
         if direct:
             return _limpar_nome_artista(str(direct))
 
@@ -436,7 +472,7 @@ def _inferir_artista_para_recomendacao(selected_entry: dict, entries: list, user
         for e in entries:
             if not isinstance(e, dict):
                 continue
-            up = e.get('uploader') or e.get('channel') or e.get('artist')
+            up = _entry_artist(e, keys=ENTRY_ARTIST_KEYS_LIGHT)
             up = _limpar_nome_artista(str(up)) if up else ''
             if not up:
                 continue
@@ -458,7 +494,7 @@ async def _salvar_historico_mongodb(ctx, title: str, url: str, artist: str = "")
         if not ctx or not getattr(ctx, 'author', None):
             return False
 
-        safe_title = (str(title).strip() if title is not None else "")
+        safe_title = _sanitizar_texto_bruto(title)
         if not safe_title:
             return False
 
@@ -468,7 +504,7 @@ async def _salvar_historico_mongodb(ctx, title: str, url: str, artist: str = "")
         if not safe_url:
             return False
 
-        safe_artist = str(artist).strip() if artist is not None else ""
+        safe_artist = _sanitizar_texto_bruto(artist)
 
         await db.create_user_profile(str(ctx.author.id), ctx.author.name)
         ok = await db.add_to_music_history(str(ctx.author.id), {
@@ -494,6 +530,7 @@ def _normalizar_tag(value: str) -> str:
 
 def _buscar_tags_artista_lastfm(artist: str, limit: int = 8) -> set[str]:
     """Retorna tags principais de um artista no Last.fm com cache simples em memória."""
+    artist = _sanitizar_texto_bruto(artist)
     artist_norm = _normalizar_texto(artist)
     if not LASTFM_API_KEY or not artist_norm:
         return set()
@@ -568,6 +605,8 @@ def _filtrar_similares_por_tematica(seed_artist: str, similar_tracks: list[tuple
 
 def _buscar_similar_lastfm(track_title: str, artist: str, limit: int = 20) -> list[tuple[str, str]]:
     """Chama Last.fm track.getSimilar e retorna lista de (artista, titulo)."""
+    track_title = _sanitizar_texto_bruto(track_title)
+    artist = _sanitizar_texto_bruto(artist)
     if not LASTFM_API_KEY or not track_title or not artist:
         logging.warning(f"[Last.fm] Chamada ignorada — key={bool(LASTFM_API_KEY)}, title='{track_title}', artist='{artist}'")
         return []
@@ -586,8 +625,8 @@ def _buscar_similar_lastfm(track_title: str, artist: str, limit: int = 20) -> li
         tracks = data.get('similartracks', {}).get('track', [])
         results = []
         for t in tracks:
-            t_name = (t.get('name') or '').strip()
-            t_artist = (t.get('artist', {}).get('name') or '').strip()
+            t_name = _sanitizar_texto_bruto(t.get('name'))
+            t_artist = _sanitizar_texto_bruto((t.get('artist', {}) or {}).get('name'))
             if t_name and t_artist:
                 results.append((t_artist, t_name))
         logging.info(f"[Last.fm] {len(results)} faixas similares encontradas para '{track_title}'")
@@ -657,14 +696,14 @@ async def buscar_recomendacao_autoplay(guild_id, ctx=None):
         if not isinstance(entry, dict):
             return
 
-        title = (entry.get('title') or '').strip()
+        title = _entry_title(entry)
         if not title:
             return
         if _parece_conteudo_nao_musical(title):
             return
         uploader = _uploader_entry(entry)
 
-        for key in ('url', 'webpage_url', 'original_url', 'id'):
+        for key in ENTRY_URL_KEYS:
             normalized = _normalizar_candidato_youtube(entry.get(key))
             if not normalized or normalized in queue_urls or normalized in seen_candidates:
                 continue
@@ -913,8 +952,8 @@ class MusicCommands(commands.Cog):
                 await ctx.send("Encontrei resultados, mas nenhum vídeo reproduzível. Tente outra busca.")
                 return
 
-            selected_title = (selected_entry.get('title') or '').strip() or 'Resultado sem titulo'
-            selected_artist = selected_entry.get('uploader') or selected_entry.get('channel') or selected_entry.get('artist')
+            selected_title = _entry_title(selected_entry) or 'Resultado sem titulo'
+            selected_artist = _entry_artist(selected_entry, keys=ENTRY_ARTIST_KEYS_LIGHT)
             artist_clean = _inferir_artista_para_recomendacao(selected_entry, entries, query_or_url)
             if not artist_clean and '-' in selected_title:
                 artist_clean = _limpar_nome_artista(selected_title.split('-', 1)[0].strip())
@@ -956,7 +995,7 @@ class MusicCommands(commands.Cog):
                     candidate_url = _entry_to_youtube_url(entry)
                     if not candidate_url or candidate_url == selected_url:
                         continue
-                    candidate_title = (entry.get('title') or '').strip()
+                    candidate_title = _entry_title(entry)
                     if not candidate_title:
                         continue
                     if any(_titulo_equivalente(candidate_title, seen) for seen in seen_related_titles):
@@ -965,7 +1004,7 @@ class MusicCommands(commands.Cog):
                     related_candidates.append({
                         'url': candidate_url,
                         'title': candidate_title,
-                        'uploader': entry.get('uploader') or entry.get('channel') or entry.get('artist')
+                        'uploader': _entry_artist(entry, keys=ENTRY_ARTIST_KEYS_LIGHT)
                     })
                     if len(related_candidates) >= 8:
                         break
