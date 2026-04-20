@@ -20,6 +20,7 @@ recent_played_titles = {}
 recent_played_uploaders = {}
 MAX_RECENT_TITLES = 12
 MAX_RECENT_UPLOADERS = 6
+manual_stop_guilds = set()
 
 
 def _normalizar_candidato_youtube(candidate):
@@ -260,6 +261,10 @@ async def buscar_recomendacao_autoplay(guild_id):
 
 async def tocar_proxima_musica(vc, guild_id, ctx):
     """Toca a próxima música da fila ou busca uma recomendada se auto-play estiver ativo."""
+    if guild_id in manual_stop_guilds:
+        manual_stop_guilds.discard(guild_id)
+        return
+
     if guild_id not in play_queue:
         play_queue[guild_id] = deque()
 
@@ -389,6 +394,10 @@ class MusicCommands(commands.Cog):
     async def stop(self, ctx):
         """Para a reprodução atual"""
         if ctx.guild.voice_client and ctx.guild.voice_client.is_playing():
+            guild_id = ctx.guild.id
+            manual_stop_guilds.add(guild_id)
+            if guild_id in play_queue:
+                play_queue[guild_id].clear()
             ctx.guild.voice_client.stop()
             await ctx.send("Reprodução parada.")
         else:
@@ -416,6 +425,7 @@ class MusicCommands(commands.Cog):
             autoplay_recent_urls.pop(guild_id, None)
             recent_played_titles.pop(guild_id, None)
             recent_played_uploaders.pop(guild_id, None)
+            manual_stop_guilds.discard(guild_id)
             await ctx.guild.voice_client.disconnect()
             await ctx.send("Desconectado do canal de voz.")
         else:
