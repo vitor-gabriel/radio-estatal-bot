@@ -187,6 +187,30 @@ def _parece_conteudo_nao_musical(title: str) -> bool:
     return any(marker in t for marker in non_music_markers)
 
 
+def _tem_marcador_musical(title: str) -> bool:
+    """Heurística positiva para identificar títulos que parecem música."""
+    t = _normalizar_texto(title)
+    if not t:
+        return False
+
+    music_markers = (
+        "official", "audio", "lyrics", "lyric", "music", "song", "clipe", "clip",
+        "live", "remix", "cover", "topic", "mv", "amv", "visualizer", "feat", "ft"
+    )
+    return any(marker in t for marker in music_markers)
+
+
+def _texto_parecido(a: str, b: str) -> bool:
+    """Compara textos curtos para validar afinidade entre artistas/canais."""
+    aa = _normalizar_texto(a)
+    bb = _normalizar_texto(b)
+    if not aa or not bb:
+        return False
+    if aa in bb or bb in aa:
+        return True
+    return difflib.SequenceMatcher(None, aa, bb).ratio() >= 0.70
+
+
 def _uploader_entry(entry: dict) -> str:
     return _normalizar_texto(
         entry.get('uploader') or entry.get('channel') or entry.get('channel_name') or entry.get('artist')
@@ -218,7 +242,7 @@ def _get_ytmusic_client():
     return _ytmusic_client
 
 
-async def _buscar_recomendacoes_musicais(query: str, max_results: int = 10):
+async def _buscar_recomendacoes_musicais(query: str, max_results: int = 10, artist_hint: str = ""):
     """Busca recomendações priorizando o catálogo de músicas do YouTube Music."""
     q = (query or '').strip()
     if not q:
@@ -253,18 +277,30 @@ async def _buscar_recomendacoes_musicais(query: str, max_results: int = 10):
     # Fallback para yt_dlp caso ytmusicapi indisponível/sem resultados.
     fallback_query = f"{q} official audio"
     raw_entries = await _buscar_musica_ou_artista(fallback_query, max_results=max_results)
+    hint = _normalizar_texto(artist_hint)
     entries = []
     for item in raw_entries:
         title = (item.get('title') or '').strip()
         if not title or _parece_conteudo_nao_musical(title):
             continue
+        uploader = item.get('uploader') or item.get('channel') or item.get('artist') or ''
+
+        # No fallback via yt_dlp, seja bem mais rígido para evitar lixo de busca.
+        # Aceita se: tem marcador musical OU canal parecido com artista sugerido.
+        if hint:
+            uploader_matches_hint = _texto_parecido(uploader, hint)
+        else:
+            uploader_matches_hint = False
+        if not _tem_marcador_musical(title) and not uploader_matches_hint:
+            continue
+
         url = _entry_to_youtube_url(item)
         if not url:
             continue
         entries.append({
             'url': url,
             'title': title,
-            'uploader': item.get('uploader') or item.get('channel') or item.get('artist'),
+            'uploader': uploader,
         })
     return entries
 
@@ -385,6 +421,34 @@ def _limpar_nome_artista(uploader: str) -> str:
     uploader = re.sub(r'\s*-\s*Topic\s*$', '', uploader, flags=re.IGNORECASE)
     uploader = re.sub(r'\s*VEVO\s*$', '', uploader, flags=re.IGNORECASE)
     return uploader.strip()
+
+
+def _inferir_artista_para_recomendacao(selected_entry: dict, entries: list, user_query: str = "") -> str:
+    """Tenta inferir artista para melhorar qualidade das recomendações."""
+    if isinstance(selected_entry, dict):
+        direct = selected_entry.get('uploader') or selected_entry.get('channel') or selected_entry.get('artist')
+        if direct:
+            return _limpar_nome_artista(str(direct))
+
+    if isinstance(entries, list):
+        counts = {}
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            up = e.get('uploader') or e.get('channel') or e.get('artist')
+            up = _limpar_nome_artista(str(up)) if up else ''
+            if not up:
+                continue
+            norm = _normalizar_texto(up)
+            counts[norm] = counts.get(norm, 0) + 1
+        if counts:
+            best_norm = max(counts.items(), key=lambda kv: kv[1])[0]
+            return best_norm
+
+    if user_query and '-' in user_query:
+        return _limpar_nome_artista(user_query.split('-', 1)[0].strip())
+
+    return ""
 
 
 def _buscar_similar_lastfm(track_title: str, artist: str, limit: int = 20) -> list[tuple[str, str]]:
@@ -520,7 +584,11 @@ async def buscar_recomendacao_autoplay(guild_id, ctx=None):
             return None, None
 
         try:
-            search_entries = await _buscar_recomendacoes_musicais(query_text, max_results=max_results)
+            search_entries = await _buscar_recomendacoes_musicais(
+                query_text,
+                max_results=max_results,
+                artist_hint=artist_clean,
+            )
 
             if search_entries:
                 antes = len(candidatos)
@@ -725,7 +793,9 @@ class MusicCommands(commands.Cog):
 
             selected_title = (selected_entry.get('title') or '').strip() or 'Resultado sem titulo'
             selected_artist = selected_entry.get('uploader') or selected_entry.get('channel') or selected_entry.get('artist')
-            artist_clean = _limpar_nome_artista(selected_artist or '') or selected_title.split('-')[0].strip()
+            artist_clean = _inferir_artista_para_recomendacao(selected_entry, entries, query_or_url)
+            if not artist_clean and '-' in selected_title:
+                artist_clean = _limpar_nome_artista(selected_title.split('-', 1)[0].strip())
 
             play_queue[guild_id].append((selected_url, preset_name))
 
@@ -753,7 +823,11 @@ class MusicCommands(commands.Cog):
             if not related_candidates:
                 # Busca explícita por músicas do mesmo artista para evitar resultados não-musicais
                 fallback_query = f"{artist_clean} official" if artist_clean else f"{selected_title} official"
-                fallback_entries = await _buscar_recomendacoes_musicais(fallback_query, max_results=10)
+                fallback_entries = await _buscar_recomendacoes_musicais(
+                    fallback_query,
+                    max_results=10,
+                    artist_hint=artist_clean,
+                )
                 # Filtra apenas entradas com URL válida e que não sejam variações da música atual
                 for entry in fallback_entries:
                     candidate_url = _entry_to_youtube_url(entry)
