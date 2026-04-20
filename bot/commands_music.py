@@ -444,8 +444,11 @@ async def buscar_recomendacao_autoplay(guild_id, ctx=None):
                 )
 
             if result and 'entries' in result:
+                antes = len(candidatos)
                 for entry in result['entries']:
                     collect_candidate(entry)
+                novos = len(candidatos) - antes
+                logging.info(f"[autoplay] Query '{query_text}': {len(result['entries'])} resultados do YT, {novos} novos candidatos (total: {len(candidatos)})")
 
                 selected_url, selected_title = _escolher_candidato_diverso(
                     candidatos,
@@ -458,6 +461,10 @@ async def buscar_recomendacao_autoplay(guild_id, ctx=None):
                 if selected_url:
                     _registrar_autoplay_recente(guild_id, selected_url)
                     return selected_url, selected_title
+                else:
+                    logging.info(f"[autoplay] Filtro de diversidade rejeitou todos os {len(candidatos)} candidatos para '{query_text}'")
+            else:
+                logging.info(f"[autoplay] Query '{query_text}': sem entries no resultado do YT")
         except Exception as e:
             logging.warning(f"Falha ao buscar autoplay com query '{query_text}' para guild {guild_id}: {e}")
 
@@ -468,11 +475,16 @@ async def buscar_recomendacao_autoplay(guild_id, ctx=None):
         logging.info(f"[Last.fm] Iniciando busca de similares para guild {guild_id} — title='{title}', artist='{artist_clean}'")
         similar_tracks = await asyncio.to_thread(_buscar_similar_lastfm, title, artist_clean)
         random.shuffle(similar_tracks)
+        logging.info(f"[Last.fm] {len(similar_tracks)} faixas similares retornadas, testando as 10 primeiras")
         for sim_artist, sim_track in similar_tracks[:10]:
             query = f"{sim_artist} {sim_track}"
+            logging.info(f"[Last.fm] Buscando no YouTube: '{query}'")
             chosen_url, chosen_title = await buscar_por_query(query, max_results=5)
             if chosen_url:
+                logging.info(f"[Last.fm] Candidato aceito: '{chosen_title}' ({chosen_url})")
                 return chosen_url, chosen_title
+            else:
+                logging.info(f"[Last.fm] Nenhum candidato aceito pelo filtro de diversidade para '{query}'")
         logging.warning(f"[Last.fm] Nenhum candidato válido encontrado via Last.fm para guild {guild_id}")
 
     # 2) Busca por outros títulos do mesmo artista (evita recomenda o mesmo título)
@@ -623,31 +635,59 @@ class MusicCommands(commands.Cog):
 
             selected_title = (selected_entry.get('title') or '').strip() or 'Resultado sem titulo'
             selected_artist = selected_entry.get('uploader') or selected_entry.get('channel') or selected_entry.get('artist')
+            artist_clean = _limpar_nome_artista(selected_artist or '') or selected_title.split('-')[0].strip()
 
             play_queue[guild_id].append((selected_url, preset_name))
 
+            # Busca recomendações via Last.fm se disponível, senão usa resultados do YouTube
             related_candidates = []
-            for entry in entries:
-                candidate_url = _entry_to_youtube_url(entry)
-                if not candidate_url or candidate_url == selected_url:
-                    continue
-                candidate_title = (entry.get('title') or '').strip()
-                if not candidate_title:
-                    continue
-                related_candidates.append({
-                    'url': candidate_url,
-                    'title': candidate_title,
-                    'uploader': entry.get('uploader') or entry.get('channel') or entry.get('artist')
-                })
-                if len(related_candidates) >= 8:
-                    break
+            seen_related_titles = [selected_title]
+
+            if LASTFM_API_KEY:
+                similar_tracks = await asyncio.to_thread(_buscar_similar_lastfm, selected_title, artist_clean, limit=10)
+                for sim_artist, sim_track in similar_tracks:
+                    display = f"{sim_artist} - {sim_track}"
+                    if any(_titulo_equivalente(sim_track, seen) for seen in seen_related_titles):
+                        continue
+                    seen_related_titles.append(sim_track)
+                    related_candidates.append({
+                        'url': None,
+                        'title': display,
+                        'uploader': sim_artist,
+                        '_lastfm': True,
+                    })
+                    if len(related_candidates) >= 8:
+                        break
+
+            # Fallback: usar resultados do YouTube quando Last.fm não está disponível ou não retornou
+            if not related_candidates:
+                for entry in entries:
+                    candidate_url = _entry_to_youtube_url(entry)
+                    if not candidate_url or candidate_url == selected_url:
+                        continue
+                    candidate_title = (entry.get('title') or '').strip()
+                    if not candidate_title:
+                        continue
+                    if any(_titulo_equivalente(candidate_title, seen) for seen in seen_related_titles):
+                        continue
+                    seen_related_titles.append(candidate_title)
+                    related_candidates.append({
+                        'url': candidate_url,
+                        'title': candidate_title,
+                        'uploader': entry.get('uploader') or entry.get('channel') or entry.get('artist')
+                    })
+                    if len(related_candidates) >= 8:
+                        break
+
+            # Para o autoplay, usa apenas entradas com URL válida do YouTube
+            related_videos_for_autoplay = [r for r in related_candidates if r.get('url')]
 
             # Salva recomendações iniciais para o autoplay usar quando a fila acabar.
             last_played_info[guild_id] = {
                 'requested_url': selected_url,
                 'title': selected_title,
                 'uploader': selected_artist,
-                'related_videos': related_candidates,
+                'related_videos': related_videos_for_autoplay,
             }
 
             await db.create_user_profile(str(ctx.author.id), ctx.author.name)
@@ -661,10 +701,11 @@ class MusicCommands(commands.Cog):
                 [f"{i + 1}. {item.get('title', 'Desconhecido')}" for i, item in enumerate(related_candidates[:5])]
             )
             if sugestoes_txt:
+                fonte = "Last.fm" if LASTFM_API_KEY and any(r.get('_lastfm') for r in related_candidates) else "YouTube"
                 await ctx.send(
                     f"Resultado da busca: **{selected_title}**\n"
                     f"Adicionado à fila com preset `{preset_name}`\n"
-                    f"Próximas recomendações:\n{sugestoes_txt}"
+                    f"Próximas recomendações ({fonte}):\n{sugestoes_txt}"
                 )
             else:
                 await ctx.send(f"Resultado da busca: **{selected_title}**\nAdicionado à fila com preset `{preset_name}`")
