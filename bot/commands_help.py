@@ -10,7 +10,7 @@ class HelpCommands(commands.Cog):
         """Mostra a lista de comandos disponíveis"""
 
         embed = discord.Embed(
-            title="🎵 Comandos do Bot Noob-Squad Music",
+            title="🎵 Comandos do Bot Music",
             description="Lista de comandos disponíveis:",
             color=discord.Color.blue()
         )
