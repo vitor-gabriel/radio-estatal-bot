@@ -92,7 +92,11 @@ def _titulo_canonico(title: str) -> str:
     normalized = re.sub(r"\([^)]*\)", " ", normalized)
     noise_words = [
         "official", "video", "audio", "lyrics", "lyric", "clipe", "clip", "live",
-        "legendado", "hd", "4k", "remastered", "version", "versao", "ptbr", "pt-br"
+        "legendado", "hd", "4k", "remastered", "version", "versao", "ptbr", "pt-br",
+        "remix", "acoustic", "cover", "instrumental", "extended", "mix", "edit",
+        "deluxe", "anniversary", "original", "explicit", "clean", "radio", "single",
+        "album", "ost", "soundtrack", "slowed", "reverb", "sped", "nightcore",
+        "visualizer", "performance", "session", "unplugged", "demo", "bonus"
     ]
     for word in noise_words:
         normalized = re.sub(rf"\b{re.escape(word)}\b", " ", normalized)
@@ -118,7 +122,7 @@ def _titulo_equivalente(title_a: str, title_b: str) -> bool:
         return False
 
     ratio = difflib.SequenceMatcher(None, a, b).ratio()
-    if ratio >= 0.72:
+    if ratio >= 0.65:
         return True
 
     ta = _token_set(a)
@@ -129,18 +133,29 @@ def _titulo_equivalente(title_a: str, title_b: str) -> bool:
     intersection = len(ta.intersection(tb))
     union = len(ta.union(tb))
     jaccard = (intersection / union) if union else 0
-    return jaccard >= 0.60
+    return jaccard >= 0.50
 
 
 def _titulo_muito_parecido(title_a: str, title_b: str) -> bool:
     """Detecta títulos muito parecidos para reduzir recomendações repetitivas."""
-    a = _normalizar_texto(title_a)
-    b = _normalizar_texto(title_b)
+    a = _titulo_canonico(title_a)
+    b = _titulo_canonico(title_b)
     if not a or not b:
         return False
 
     ratio = difflib.SequenceMatcher(None, a, b).ratio()
-    return ratio >= 0.78
+    if ratio >= 0.65:
+        return True
+
+    ta = _token_set(a)
+    tb = _token_set(b)
+    if not ta or not tb:
+        return False
+
+    intersection = len(ta.intersection(tb))
+    union = len(ta.union(tb))
+    jaccard = (intersection / union) if union else 0
+    return jaccard >= 0.50
 
 
 def _uploader_entry(entry: dict) -> str:
