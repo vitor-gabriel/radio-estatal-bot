@@ -6,6 +6,7 @@ import asyncio
 import random
 import difflib
 import re
+import urllib.parse
 from collections import deque
 
 from db.database import db
@@ -118,6 +119,55 @@ def _uploader_entry(entry: dict) -> str:
     return _normalizar_texto(
         entry.get('uploader') or entry.get('channel') or entry.get('channel_name') or entry.get('artist')
     )
+
+
+def _entry_to_youtube_url(entry: dict):
+    if not isinstance(entry, dict):
+        return None
+
+    for key in ('url', 'webpage_url', 'original_url', 'id'):
+        normalized = _normalizar_candidato_youtube(entry.get(key))
+        if normalized:
+            return normalized
+    return None
+
+
+async def _buscar_musica_ou_artista(query: str, max_results: int = 10):
+    """Busca músicas por texto (artista/música) e retorna entradas do yt_dlp."""
+    q = (query or '').strip()
+    if not q:
+        return []
+
+    encoded_query = urllib.parse.quote_plus(q)
+    ytmusic_url = f"https://music.youtube.com/search?q={encoded_query}"
+
+    # 1) Tenta busca pelo endpoint do YouTube Music.
+    try:
+        with yt_dlp.YoutubeDL({'quiet': True, 'extract_flat': True}) as ydl:
+            result = await asyncio.to_thread(ydl.extract_info, ytmusic_url, download=False)
+        if result and isinstance(result, dict) and result.get('entries'):
+            return [e for e in result['entries'] if e]
+    except Exception as e:
+        logging.info(f"Busca no YouTube Music falhou para '{q}', usando fallback ytsearch: {e}")
+
+    # 2) Fallback robusto via ytsearch.
+    try:
+        with yt_dlp.YoutubeDL({
+            'quiet': True,
+            'extract_flat': True,
+            'default_search': f'ytsearch{max_results}'
+        }) as ydl:
+            result = await asyncio.to_thread(
+                ydl.extract_info,
+                f"ytsearch{max_results}:{q.replace('&', 'and')}",
+                download=False,
+            )
+        if result and isinstance(result, dict) and result.get('entries'):
+            return [e for e in result['entries'] if e]
+    except Exception as e:
+        logging.warning(f"Falha no fallback ytsearch para '{q}': {e}")
+
+    return []
 
 
 def _registrar_autoplay_recente(guild_id: int, url: str):
@@ -382,8 +432,15 @@ async def tocar_proxima_musica(vc, guild_id, ctx):
     source, stream_title, info = await stream_musica(url, preset_name)
 
     if source:
+        previous_info = last_played_info.get(guild_id) or {}
         track_info = info or {}
         track_info['requested_url'] = url
+        if (
+            'related_videos' not in track_info
+            and previous_info.get('requested_url') == url
+            and previous_info.get('related_videos')
+        ):
+            track_info['related_videos'] = previous_info.get('related_videos')
         last_played_info[guild_id] = track_info
         _registrar_faixa_tocada(
             guild_id,
@@ -408,17 +465,18 @@ class MusicCommands(commands.Cog):
         self.bot = bot
 
     @commands.command(name='play')
-    async def play(self, ctx, url: str = None):
+    async def play(self, ctx, *input_parts):
         """Toca uma música ou adiciona à fila
-        Uso: !play <url>"""
+        Uso: !play <artista e musica>"""
         # 1. Validar canal correto
         if not validar_canal(ctx):
             await ctx.send("O Animal, Use o canal JUKEBOX para comandos de música.")
             return
 
-        # 2. Validar se a URL foi fornecida
-        if not url:
-            await ctx.send("Ei! Você precisa me dar uma URL do YouTube. Uso correto: `!play <url>`")
+        # 2. Validar se o termo de busca foi fornecido
+        query_or_url = " ".join(input_parts).strip()
+        if not query_or_url:
+            await ctx.send("Ei! Você precisa me dar um termo de busca. Uso correto: `!play <artista e musica>`")
             return
 
         # 3. Validar se está em um canal de voz
@@ -442,36 +500,71 @@ class MusicCommands(commands.Cog):
 
         preset_name = active_preset.get(guild_id, 'padrao')
 
-        cleaned_url = clean_youtube_url(url)
-        if not is_youtube_url(cleaned_url):
-            await ctx.send("URL inválida. Use uma URL do YouTube.")
-            return
-
         try:
             async with ctx.typing():
-                with yt_dlp.YoutubeDL({'extract_flat': 'True', 'quiet': True}) as ydl:
-                    info = await asyncio.to_thread(ydl.extract_info, cleaned_url, download=False)
+                entries = await _buscar_musica_ou_artista(query_or_url, max_results=12)
 
-            if 'entries' in info:
-                title = info.get('title', 'Playlist')
-                playlist_urls = [entry['url'] for entry in info['entries']]
-                await db.create_user_profile(str(ctx.author.id), ctx.author.name)
+            if not entries:
+                await ctx.send("Não encontrei resultados para sua busca. Tente outro termo.")
+                return
 
-                for playlist_url in playlist_urls:
-                    play_queue[guild_id].append((playlist_url, preset_name))
+            selected_entry = None
+            selected_url = None
+            for entry in entries:
+                candidate_url = _entry_to_youtube_url(entry)
+                if candidate_url:
+                    selected_entry = entry
+                    selected_url = candidate_url
+                    break
 
-                await ctx.send(f'Adicionando **{len(playlist_urls)}** músicas da playlist **{title}** à fila.')
-            else:
-                title = info.get('title', 'Desconhecido')
-                play_queue[guild_id].append((cleaned_url, preset_name))
+            if not selected_url:
+                await ctx.send("Encontrei resultados, mas nenhum vídeo reproduzível. Tente outra busca.")
+                return
 
-                await db.create_user_profile(str(ctx.author.id), ctx.author.name)
-                await db.add_to_music_history(str(ctx.author.id), {
-                    "title": title,
-                    "url": cleaned_url
+            selected_title = selected_entry.get('title', 'Desconhecido')
+            selected_artist = selected_entry.get('uploader') or selected_entry.get('channel') or selected_entry.get('artist')
+
+            play_queue[guild_id].append((selected_url, preset_name))
+
+            related_candidates = []
+            for entry in entries:
+                candidate_url = _entry_to_youtube_url(entry)
+                if not candidate_url or candidate_url == selected_url:
+                    continue
+                related_candidates.append({
+                    'url': candidate_url,
+                    'title': entry.get('title', 'Desconhecido'),
+                    'uploader': entry.get('uploader') or entry.get('channel') or entry.get('artist')
                 })
+                if len(related_candidates) >= 8:
+                    break
 
-                await ctx.send(f'Adicionado à fila: **{title}** com preset `{preset_name}`')
+            # Salva recomendações iniciais para o autoplay usar quando a fila acabar.
+            last_played_info[guild_id] = {
+                'requested_url': selected_url,
+                'title': selected_title,
+                'uploader': selected_artist,
+                'related_videos': related_candidates,
+            }
+
+            await db.create_user_profile(str(ctx.author.id), ctx.author.name)
+            await db.add_to_music_history(str(ctx.author.id), {
+                "title": selected_title,
+                "url": selected_url,
+                "artist": selected_artist,
+            })
+
+            sugestoes_txt = "\n".join(
+                [f"{i + 1}. {item.get('title', 'Desconhecido')}" for i, item in enumerate(related_candidates[:5])]
+            )
+            if sugestoes_txt:
+                await ctx.send(
+                    f"Resultado da busca: **{selected_title}**\n"
+                    f"Adicionado à fila com preset `{preset_name}`\n"
+                    f"Próximas recomendações:\n{sugestoes_txt}"
+                )
+            else:
+                await ctx.send(f"Resultado da busca: **{selected_title}**\nAdicionado à fila com preset `{preset_name}`")
 
             if not vc.is_playing() and not vc.is_paused():
                 await tocar_proxima_musica(vc, guild_id, ctx)

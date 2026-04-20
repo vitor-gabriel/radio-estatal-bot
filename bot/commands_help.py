@@ -18,7 +18,7 @@ class HelpCommands(commands.Cog):
         embed.add_field(
             name="Comandos de Música",
             value="""
-                `!play <url>` - Toca uma música do YouTube ou adiciona à fila
+                `!play <artista ou musica>` - Busca por texto e toca o melhor resultado (com sugestões)
                 `!preset [padrao|bassboost|pop|rock|status]` - Alterna o preset de equalização
                 `!autoplay [on|off|status]` - Controla a reprodução automática de recomendadas
                 `!skip` - Pula para a próxima música
