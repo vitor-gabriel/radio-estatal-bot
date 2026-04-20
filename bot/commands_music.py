@@ -452,6 +452,42 @@ def _inferir_artista_para_recomendacao(selected_entry: dict, entries: list, user
     return ""
 
 
+async def _salvar_historico_mongodb(ctx, title: str, url: str, artist: str = ""):
+    """Salva faixa no histórico do MongoDB com saneamento de dados."""
+    try:
+        if not ctx or not getattr(ctx, 'author', None):
+            return False
+
+        safe_title = (str(title).strip() if title is not None else "")
+        if not safe_title:
+            return False
+
+        safe_url = _normalizar_candidato_youtube(url) if url else None
+        if not safe_url and url is not None:
+            safe_url = str(url).strip()
+        if not safe_url:
+            return False
+
+        safe_artist = str(artist).strip() if artist is not None else ""
+
+        await db.create_user_profile(str(ctx.author.id), ctx.author.name)
+        ok = await db.add_to_music_history(str(ctx.author.id), {
+            "title": safe_title,
+            "url": safe_url,
+            "artist": safe_artist or None,
+        })
+
+        if not ok:
+            logging.warning(
+                f"[MongoDB] Falha ao registrar música no histórico para usuário {ctx.author.id}: "
+                f"title='{safe_title}', url='{safe_url}'"
+            )
+        return ok
+    except Exception as e:
+        logging.error(f"[MongoDB] Erro ao salvar histórico musical: {e}")
+        return False
+
+
 def _normalizar_tag(value: str) -> str:
     return re.sub(r"[^a-z0-9\s]", "", _normalizar_texto(value))
 
@@ -797,6 +833,12 @@ async def tocar_proxima_musica(vc, guild_id, ctx):
             stream_title,
             (track_info.get('uploader') or track_info.get('channel') or track_info.get('artist') or '')
         )
+        await _salvar_historico_mongodb(
+            ctx,
+            stream_title,
+            url,
+            (track_info.get('uploader') or track_info.get('channel') or track_info.get('artist') or '')
+        )
         try:
             vc.play(source, after=lambda e: asyncio.run_coroutine_threadsafe(
                 tocar_proxima_musica(vc, guild_id, ctx), ctx.bot.loop))
@@ -938,13 +980,6 @@ class MusicCommands(commands.Cog):
                 'uploader': selected_artist,
                 'related_videos': related_videos_for_autoplay,
             }
-
-            await db.create_user_profile(str(ctx.author.id), ctx.author.name)
-            await db.add_to_music_history(str(ctx.author.id), {
-                "title": selected_title,
-                "url": selected_url,
-                "artist": selected_artist,
-            })
 
             sugestoes_txt = "\n".join(
                 [f"{i + 1}. {item.get('title', 'Desconhecido')}" for i, item in enumerate(related_candidates[:5])]
