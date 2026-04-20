@@ -661,7 +661,11 @@ class MusicCommands(commands.Cog):
 
             # Fallback: usar resultados do YouTube quando Last.fm não está disponível ou não retornou
             if not related_candidates:
-                for entry in entries:
+                # Busca explícita por músicas do mesmo artista para evitar resultados não-musicais
+                fallback_query = f"{artist_clean} official" if artist_clean else f"{selected_title} official"
+                fallback_entries = await _buscar_musica_ou_artista(fallback_query, max_results=10)
+                # Filtra apenas entradas com URL válida e que não sejam variações da música atual
+                for entry in fallback_entries:
                     candidate_url = _entry_to_youtube_url(entry)
                     if not candidate_url or candidate_url == selected_url:
                         continue
