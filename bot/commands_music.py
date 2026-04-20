@@ -587,7 +587,17 @@ def _filter_similar_by_theme(
     seed_artist: str,
     similar_tracks: list[tuple[str, str]],
 ) -> list[tuple[str, str]]:
-    """Filtra similares fora do estilo dominante do artista base."""
+    """
+    Filtra similares fora do estilo dominante do artista base.
+
+    Define "famílias" de gêneros musicais genéricos e rejeita candidatos
+    de famílias incompatíveis quando não há tags em comum com o artista semente.
+
+    Famílias cobertas:
+      rock/metal · pop · eletrônico/dance · hip-hop/rap · r&b/soul ·
+      jazz/blues · clássico/erudito · country/folk · reggae/ska ·
+      sertanejo/forró/axé · k-pop/j-pop
+    """
     if not similar_tracks or not seed_artist or not LASTFM_API_KEY:
         return similar_tracks
 
@@ -595,10 +605,102 @@ def _filter_similar_by_theme(
     if not seed_tags:
         return similar_tracks
 
-    seed_is_rock = any(t in seed_tags for t in ("rock", "alternative rock", "metal", "nu metal", "hard rock"))
-    seed_is_pop = any(t in seed_tags for t in ("pop", "dance pop", "electropop"))
+    # ------------------------------------------------------------------
+    # Famílias de gênero: cada entrada é (nome, frozenset de tags)
+    # ------------------------------------------------------------------
+    GENRE_FAMILIES: list[tuple[str, frozenset[str]]] = [
+        ("rock_metal", frozenset({
+            "rock", "alternative rock", "indie rock", "classic rock", "hard rock",
+            "punk", "punk rock", "post-punk", "progressive rock", "psychedelic rock",
+            "grunge", "metal", "heavy metal", "nu metal", "thrash metal",
+            "death metal", "black metal", "doom metal", "power metal",
+            "metalcore", "deathcore", "grindcore", "emo", "screamo",
+        })),
+        ("pop", frozenset({
+            "pop", "dance pop", "electropop", "synth-pop", "indie pop",
+            "art pop", "chamber pop", "power pop", "teen pop", "bubblegum pop",
+            "k-pop", "j-pop", "cantopop", "mandopop",
+        })),
+        ("electronic_dance", frozenset({
+            "electronic", "edm", "house", "deep house", "tech house",
+            "techno", "trance", "drum and bass", "dnb", "dubstep",
+            "ambient", "idm", "electronica", "chillout", "lo-fi",
+            "synthwave", "retrowave", "disco", "dance", "club",
+        })),
+        ("hip_hop_rap", frozenset({
+            "hip hop", "hip-hop", "rap", "trap", "grime", "drill",
+            "conscious hip hop", "east coast hip hop", "west coast hip hop",
+            "crunk", "mumble rap", "phonk",
+        })),
+        ("rnb_soul", frozenset({
+            "r&b", "rnb", "soul", "neo soul", "funk", "gospel",
+            "motown", "quiet storm", "contemporary r&b",
+        })),
+        ("jazz_blues", frozenset({
+            "jazz", "blues", "swing", "bebop", "smooth jazz", "fusion",
+            "blues rock", "rhythm and blues", "delta blues", "chicago blues",
+            "big band", "bossa nova", "latin jazz",
+        })),
+        ("classical", frozenset({
+            "classical", "classical music", "opera", "orchestral", "symphony",
+            "chamber music", "baroque", "romantic", "contemporary classical",
+            "soundtrack", "score", "film score",
+        })),
+        ("country_folk", frozenset({
+            "country", "folk", "americana", "bluegrass", "outlaw country",
+            "country pop", "country rock", "folk rock", "singer-songwriter",
+            "acoustic", "roots",
+        })),
+        ("reggae_ska", frozenset({
+            "reggae", "ska", "dancehall", "dub", "roots reggae",
+            "reggaeton", "latin",
+        })),
+        ("brazilian", frozenset({
+            "sertanejo", "forro", "forró", "axe", "axé", "pagode",
+            "samba", "mpb", "musica popular brasileira", "brega",
+            "funk carioca", "baile funk", "piseiro", "arrocha",
+        })),
+    ]
 
+    # ------------------------------------------------------------------
+    # Detecta a família dominante do artista semente
+    # ------------------------------------------------------------------
+    def _detect_family(tags: set[str]) -> Optional[str]:
+        best_name, best_score = None, 0
+        for name, family_tags in GENRE_FAMILIES:
+            score = len(tags & family_tags)
+            if score > best_score:
+                best_name, best_score = name, score
+        return best_name if best_score > 0 else None
+
+    # Pré-monta um mapa família → tags para lookup rápido
+    family_map: dict[str, frozenset[str]] = dict(GENRE_FAMILIES)
+
+    seed_family = _detect_family(seed_tags)
+
+    # ------------------------------------------------------------------
+    # Famílias consideradas incompatíveis entre si
+    # ------------------------------------------------------------------
+    INCOMPATIBLE: dict[str, frozenset[str]] = {
+        "rock_metal":       frozenset({"pop", "hip_hop_rap", "electronic_dance", "k-pop/j-pop", "brazilian", "reggae_ska", "classical"}),
+        "pop":              frozenset({"rock_metal", "jazz_blues", "classical", "country_folk", "reggae_ska"}),
+        "electronic_dance": frozenset({"rock_metal", "jazz_blues", "classical", "country_folk", "brazilian"}),
+        "hip_hop_rap":      frozenset({"rock_metal", "classical", "country_folk", "jazz_blues", "reggae_ska"}),
+        "rnb_soul":         frozenset({"rock_metal", "classical", "country_folk", "electronic_dance"}),
+        "jazz_blues":       frozenset({"hip_hop_rap", "electronic_dance", "pop", "rock_metal", "brazilian"}),
+        "classical":        frozenset({"hip_hop_rap", "electronic_dance", "rock_metal", "pop", "reggae_ska", "brazilian"}),
+        "country_folk":     frozenset({"hip_hop_rap", "electronic_dance", "pop", "rnb_soul", "brazilian"}),
+        "reggae_ska":       frozenset({"rock_metal", "classical", "hip_hop_rap", "country_folk"}),
+        "brazilian":        frozenset({"rock_metal", "classical", "jazz_blues", "electronic_dance"}),
+    }
+
+    incompatible_families = INCOMPATIBLE.get(seed_family, frozenset()) if seed_family else frozenset()
+
+    # ------------------------------------------------------------------
+    # Filtragem
+    # ------------------------------------------------------------------
     themed, fallback = [], []
+
     for sim_artist, sim_track in similar_tracks:
         sim_tags = _lastfm_artist_tags(sim_artist)
         if not sim_tags:
@@ -606,9 +708,10 @@ def _filter_similar_by_theme(
             continue
 
         shared = seed_tags & sim_tags
-        if seed_is_rock and any(t in sim_tags for t in ("kpop", "k-pop", "jpop", "j-pop")) and not shared:
-            continue
-        if seed_is_pop and any(t in sim_tags for t in ("death metal", "black metal", "grindcore")) and not shared:
+        sim_family = _detect_family(sim_tags)
+
+        # Rejeita sem partilha de tags quando a família é incompatível
+        if not shared and sim_family and sim_family in incompatible_families:
             continue
 
         (themed if shared else fallback).append((sim_artist, sim_track))
