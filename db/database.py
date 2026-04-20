@@ -45,11 +45,28 @@ class Database:
             self.client.close()
             logging.info("Conexão com MongoDB fechada.")
 
+    def _ensure_connected(self) -> bool:
+        """Garante que a conexão/coleções estejam prontas antes de operar."""
+        if self.db is not None and self.user_profiles is not None:
+            return True
+        try:
+            self.connect()
+            return self.db is not None and self.user_profiles is not None
+        except Exception as e:
+            logging.error(f"Erro ao garantir conexão MongoDB: {e}")
+            return False
+
     async def create_user_profile(
         self, discord_id: str, username: str, display_name: str = None
     ):
         """Cria um novo perfil de usuário se não existir"""
         try:
+            if not self._ensure_connected():
+                return False
+
+            discord_id = str(discord_id)
+            username = str(username or discord_id)
+
             # Criamos um novo perfil - os valores padrão serão inicializados pelo __post_init__
             profile = UserProfile(
                 discord_id=discord_id,
@@ -119,25 +136,50 @@ class Database:
     async def add_to_music_history(self, discord_id: str, song_info: dict):
         """Adiciona uma música ao histórico do usuário e atualiza preferências"""
         try:
+            if not self._ensure_connected():
+                return False
+
+            discord_id = str(discord_id)
+            if not isinstance(song_info, dict):
+                logging.warning("add_to_music_history recebeu song_info inválido")
+                return False
+
+            title = (song_info.get("title") or "").strip()
+            url = (song_info.get("url") or "").strip()
+            if not title or not url:
+                logging.warning(
+                    f"add_to_music_history ignorado: title/url inválidos para usuário {discord_id}"
+                )
+                return False
+
             song = Song(
-                title=song_info["title"],
-                url=song_info["url"],
+                title=title,
+                url=url,
                 played_at=datetime.now(UTC),
                 artist=song_info.get("artist"),
                 genre=song_info.get("genre"),
             )
 
-            # Adiciona ao histórico
+            # Adiciona ao histórico com upsert para nunca perder o registro.
+            now = datetime.now(UTC)
             result = self.db.user_profiles.update_one(
                 {"discord_id": discord_id},
                 {
+                    "$setOnInsert": {
+                        "discord_id": discord_id,
+                        "username": str(song_info.get("username") or discord_id),
+                        "display_name": str(song_info.get("display_name") or song_info.get("username") or discord_id),
+                        "music_preferences": [],
+                        "created_at": now,
+                    },
                     "$push": {
                         "music_history": {
                             "$each": [vars(song)],
                             "$slice": -100,  # Mantém apenas as últimas 100 músicas
                         }
-                    }
+                    },
                 },
+                upsert=True,
             )
 
             # Atualiza preferências se houver artista ou gênero
@@ -146,8 +188,16 @@ class Database:
             if song.genre:
                 await self.add_music_preference(discord_id, song.genre, "genre")
 
-            logging.info(f"Música adicionada ao histórico do usuário {discord_id}")
-            return result.modified_count > 0
+            success = bool(result.modified_count > 0 or result.upserted_id is not None)
+            logging.info(
+                "Música adicionada ao histórico do usuário %s "
+                "(matched=%s, modified=%s, upserted=%s)",
+                discord_id,
+                result.matched_count,
+                result.modified_count,
+                bool(result.upserted_id),
+            )
+            return success
         except Exception as e:
             logging.error(f"Erro ao adicionar música ao histórico: {str(e)}")
             return False
@@ -173,6 +223,8 @@ class Database:
     async def get_user_profile(self, discord_id: str) -> UserProfile:
         """Recupera o perfil do usuário"""
         try:
+            if not self._ensure_connected():
+                return None
             data = self.db.user_profiles.find_one({"discord_id": discord_id})
             if data:
                 return UserProfile.from_dict(data)
