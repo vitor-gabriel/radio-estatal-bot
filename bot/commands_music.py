@@ -25,7 +25,7 @@ manual_stop_guilds = set()
 
 
 def _normalizar_candidato_youtube(candidate):
-    """Converte diferentes formatos de identificador para URL válida do YouTube."""
+    """Converte diferentes formatos para URL canônica de vídeo do YouTube."""
     if not candidate:
         return None
 
@@ -33,17 +33,45 @@ def _normalizar_candidato_youtube(candidate):
     if not value:
         return None
 
-    if value.startswith('http://') or value.startswith('https://'):
+    def _is_video_id(video_id: str) -> bool:
+        return bool(video_id and re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id))
+
+    def _extract_video_id(url: str):
         try:
-            cleaned = clean_youtube_url(value)
+            parsed = urllib.parse.urlparse(url)
+            host = (parsed.netloc or '').lower()
+            path = (parsed.path or '').strip('/')
+
+            if host in ('youtu.be', 'www.youtu.be'):
+                candidate_id = path.split('/')[0] if path else ''
+                return candidate_id if _is_video_id(candidate_id) else None
+
+            if 'youtube.com' in host or 'music.youtube.com' in host:
+                query = urllib.parse.parse_qs(parsed.query)
+                if 'v' in query and query['v']:
+                    candidate_id = query['v'][0]
+                    if _is_video_id(candidate_id):
+                        return candidate_id
+
+                segments = path.split('/') if path else []
+                if len(segments) >= 2 and segments[0] in ('shorts', 'embed', 'live'):
+                    candidate_id = segments[1]
+                    if _is_video_id(candidate_id):
+                        return candidate_id
         except Exception:
             return None
-        return cleaned if is_youtube_url(cleaned) else None
+
+        return None
+
+    if value.startswith('http://') or value.startswith('https://'):
+        if not is_youtube_url(value):
+            return None
+        video_id = _extract_video_id(value)
+        return f"https://www.youtube.com/watch?v={video_id}" if video_id else None
 
     # yt_dlp pode retornar apenas o id do vídeo em alguns cenários (extract_flat).
-    if len(value) == 11 and '/' not in value and '?' not in value:
-        cleaned = clean_youtube_url(f"https://www.youtube.com/watch?v={value}")
-        return cleaned if is_youtube_url(cleaned) else None
+    if _is_video_id(value):
+        return f"https://www.youtube.com/watch?v={value}"
 
     return None
 
@@ -301,7 +329,9 @@ async def buscar_recomendacao_autoplay(guild_id, ctx=None):
         if not isinstance(entry, dict):
             return
 
-        title = entry.get('title', 'Desconhecido')
+        title = (entry.get('title') or '').strip()
+        if not title:
+            return
         uploader = _uploader_entry(entry)
 
         for key in ('url', 'webpage_url', 'original_url', 'id'):
@@ -521,7 +551,7 @@ class MusicCommands(commands.Cog):
                 await ctx.send("Encontrei resultados, mas nenhum vídeo reproduzível. Tente outra busca.")
                 return
 
-            selected_title = selected_entry.get('title', 'Desconhecido')
+            selected_title = (selected_entry.get('title') or '').strip() or 'Resultado sem titulo'
             selected_artist = selected_entry.get('uploader') or selected_entry.get('channel') or selected_entry.get('artist')
 
             play_queue[guild_id].append((selected_url, preset_name))
@@ -531,9 +561,12 @@ class MusicCommands(commands.Cog):
                 candidate_url = _entry_to_youtube_url(entry)
                 if not candidate_url or candidate_url == selected_url:
                     continue
+                candidate_title = (entry.get('title') or '').strip()
+                if not candidate_title:
+                    continue
                 related_candidates.append({
                     'url': candidate_url,
-                    'title': entry.get('title', 'Desconhecido'),
+                    'title': candidate_title,
                     'uploader': entry.get('uploader') or entry.get('channel') or entry.get('artist')
                 })
                 if len(related_candidates) >= 8:
