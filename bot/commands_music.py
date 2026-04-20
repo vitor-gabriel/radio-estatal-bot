@@ -10,6 +10,11 @@ import urllib.parse
 import requests
 from collections import deque
 
+try:
+    from ytmusicapi import YTMusic
+except Exception:
+    YTMusic = None
+
 from db.database import db
 from config.settings import EQUALIZER_PRESETS, LASTFM_API_KEY
 from .utils import clean_youtube_url, is_youtube_url, stream_musica
@@ -30,6 +35,7 @@ recent_played_uploaders = {}
 MAX_RECENT_TITLES = 12
 MAX_RECENT_UPLOADERS = 6
 manual_stop_guilds = set()
+_ytmusic_client = None
 
 
 def _normalizar_candidato_youtube(candidate):
@@ -196,6 +202,71 @@ def _entry_to_youtube_url(entry: dict):
         if normalized:
             return normalized
     return None
+
+
+def _get_ytmusic_client():
+    """Inicializa cliente do YouTube Music sem autenticação para buscas públicas."""
+    global _ytmusic_client
+    if YTMusic is None:
+        return None
+    if _ytmusic_client is None:
+        try:
+            _ytmusic_client = YTMusic()
+        except Exception as e:
+            logging.warning(f"Falha ao inicializar ytmusicapi: {e}")
+            _ytmusic_client = None
+    return _ytmusic_client
+
+
+async def _buscar_recomendacoes_musicais(query: str, max_results: int = 10):
+    """Busca recomendações priorizando o catálogo de músicas do YouTube Music."""
+    q = (query or '').strip()
+    if not q:
+        return []
+
+    client = _get_ytmusic_client()
+    if client:
+        try:
+            results = await asyncio.to_thread(client.search, q, filter="songs", limit=max_results)
+            entries = []
+            for item in results or []:
+                video_id = (item.get('videoId') or '').strip()
+                title = (item.get('title') or '').strip()
+                if not video_id or not title or _parece_conteudo_nao_musical(title):
+                    continue
+
+                artists = item.get('artists') or []
+                artist_name = ''
+                if artists and isinstance(artists, list):
+                    artist_name = (artists[0].get('name') or '').strip()
+
+                entries.append({
+                    'url': f"https://www.youtube.com/watch?v={video_id}",
+                    'title': title,
+                    'uploader': artist_name,
+                })
+            if entries:
+                return entries
+        except Exception as e:
+            logging.warning(f"Falha na busca ytmusicapi para '{q}': {e}")
+
+    # Fallback para yt_dlp caso ytmusicapi indisponível/sem resultados.
+    fallback_query = f"{q} official audio"
+    raw_entries = await _buscar_musica_ou_artista(fallback_query, max_results=max_results)
+    entries = []
+    for item in raw_entries:
+        title = (item.get('title') or '').strip()
+        if not title or _parece_conteudo_nao_musical(title):
+            continue
+        url = _entry_to_youtube_url(item)
+        if not url:
+            continue
+        entries.append({
+            'url': url,
+            'title': title,
+            'uploader': item.get('uploader') or item.get('channel') or item.get('artist'),
+        })
+    return entries
 
 
 async def _buscar_musica_ou_artista(query: str, max_results: int = 10):
@@ -449,24 +520,15 @@ async def buscar_recomendacao_autoplay(guild_id, ctx=None):
             return None, None
 
         try:
-            with yt_dlp.YoutubeDL({
-                'quiet': True,
-                'extract_flat': True,
-                'default_search': f'ytsearch{max_results}'
-            }) as ydl:
-                result = await asyncio.to_thread(
-                    ydl.extract_info,
-                    f"ytsearch{max_results}:{query_text.replace('&', 'and')}",
-                    download=False
-                )
+            search_entries = await _buscar_recomendacoes_musicais(query_text, max_results=max_results)
 
-            if result and 'entries' in result:
+            if search_entries:
                 antes = len(candidatos)
-                for entry in result['entries']:
+                for entry in search_entries:
                     collect_candidate(entry)
                 novos = len(candidatos) - antes
                 novos_candidatos = candidatos[antes:]
-                logging.info(f"[autoplay] Query '{query_text}': {len(result['entries'])} resultados do YT, {novos} novos candidatos (total: {len(candidatos)})")
+                logging.info(f"[autoplay] Query '{query_text}': {len(search_entries)} resultados musicais, {novos} novos candidatos (total: {len(candidatos)})")
 
                 selected_url, selected_title = _escolher_candidato_diverso(
                     candidatos,
@@ -492,7 +554,7 @@ async def buscar_recomendacao_autoplay(guild_id, ctx=None):
                         logging.info(f"[autoplay] Modo relaxado escolheu '{fallback_title}' para query '{query_text}'")
                         return fallback_url, fallback_title
             else:
-                logging.info(f"[autoplay] Query '{query_text}': sem entries no resultado do YT")
+                logging.info(f"[autoplay] Query '{query_text}': sem resultados musicais")
         except Exception as e:
             logging.warning(f"Falha ao buscar autoplay com query '{query_text}' para guild {guild_id}: {e}")
 
@@ -691,7 +753,7 @@ class MusicCommands(commands.Cog):
             if not related_candidates:
                 # Busca explícita por músicas do mesmo artista para evitar resultados não-musicais
                 fallback_query = f"{artist_clean} official" if artist_clean else f"{selected_title} official"
-                fallback_entries = await _buscar_musica_ou_artista(fallback_query, max_results=10)
+                fallback_entries = await _buscar_recomendacoes_musicais(fallback_query, max_results=10)
                 # Filtra apenas entradas com URL válida e que não sejam variações da música atual
                 for entry in fallback_entries:
                     candidate_url = _entry_to_youtube_url(entry)
