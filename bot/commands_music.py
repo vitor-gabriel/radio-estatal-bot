@@ -3,12 +3,18 @@ import discord
 from discord.ext import commands
 import yt_dlp
 import asyncio
+import random
+import difflib
 from collections import deque
 
 from db.database import db
 from config.settings import EQUALIZER_PRESETS
 from .utils import clean_youtube_url, is_youtube_url, stream_musica
 from .commands_utils import validar_canal, play_queue, last_played_info, autoplay_enabled, active_preset
+
+
+MAX_AUTOPLAY_RECENTES = 20
+autoplay_recent_urls = {}
 
 
 def _normalizar_candidato_youtube(candidate):
@@ -35,10 +41,75 @@ def _normalizar_candidato_youtube(candidate):
     return None
 
 
+def _normalizar_texto(value: str) -> str:
+    if not value:
+        return ""
+    return " ".join(str(value).lower().split())
+
+
+def _titulo_muito_parecido(title_a: str, title_b: str) -> bool:
+    """Detecta títulos muito parecidos para reduzir recomendações repetitivas."""
+    a = _normalizar_texto(title_a)
+    b = _normalizar_texto(title_b)
+    if not a or not b:
+        return False
+
+    ratio = difflib.SequenceMatcher(None, a, b).ratio()
+    return ratio >= 0.78
+
+
+def _uploader_entry(entry: dict) -> str:
+    return _normalizar_texto(
+        entry.get('uploader') or entry.get('channel') or entry.get('channel_name') or entry.get('artist')
+    )
+
+
+def _registrar_autoplay_recente(guild_id: int, url: str):
+    cleaned = _normalizar_candidato_youtube(url)
+    if not cleaned:
+        return
+
+    if guild_id not in autoplay_recent_urls:
+        autoplay_recent_urls[guild_id] = deque(maxlen=MAX_AUTOPLAY_RECENTES)
+    autoplay_recent_urls[guild_id].append(cleaned)
+
+
+def _escolher_candidato_diverso(candidatos, last_title: str, last_uploader: str):
+    """Escolhe um candidato privilegiando diversidade de título e uploader."""
+    if not candidatos:
+        return None, None
+
+    faixa_diversa = []
+    faixa_media = []
+    faixa_fallback = []
+
+    for url, title, uploader in candidatos:
+        same_uploader = bool(last_uploader and uploader and uploader == last_uploader)
+        similar_title = _titulo_muito_parecido(last_title, title)
+
+        if not same_uploader and not similar_title:
+            faixa_diversa.append((url, title))
+        elif not similar_title:
+            faixa_media.append((url, title))
+        else:
+            faixa_fallback.append((url, title))
+
+    for faixa in (faixa_diversa, faixa_media, faixa_fallback):
+        if faixa:
+            return random.choice(faixa)
+
+    return None, None
+
+
 async def buscar_recomendacao_autoplay(guild_id):
     """Busca uma URL recomendada para autoplay com fallback por pesquisa."""
     info = last_played_info.get(guild_id) or {}
-    queue_urls = set()
+    queue_urls = set(autoplay_recent_urls.get(guild_id, []))
+    candidatos = []
+    seen_candidates = set()
+
+    last_title = info.get('title', '')
+    last_uploader = _normalizar_texto(info.get('uploader') or info.get('channel') or info.get('artist'))
 
     for entry in play_queue.get(guild_id, []):
         try:
@@ -52,25 +123,34 @@ async def buscar_recomendacao_autoplay(guild_id):
     if current_url:
         queue_urls.add(current_url)
 
-    def pick_url(entry):
+    def collect_candidate(entry):
         if not isinstance(entry, dict):
-            return None
+            return
+
+        title = entry.get('title', 'Desconhecido')
+        uploader = _uploader_entry(entry)
 
         for key in ('url', 'webpage_url', 'original_url', 'id'):
             normalized = _normalizar_candidato_youtube(entry.get(key))
-            if normalized and normalized not in queue_urls:
-                return normalized, entry.get('title', 'Desconhecido')
-        return None
+            if not normalized or normalized in queue_urls or normalized in seen_candidates:
+                continue
+
+            seen_candidates.add(normalized)
+            candidatos.append((normalized, title, uploader))
+            return
 
     related_videos = info.get('related_videos') or []
     if isinstance(related_videos, list):
         for video in related_videos:
-            picked = pick_url(video)
-            if picked:
-                return picked
+            collect_candidate(video)
 
-    title = info.get('title', '').strip()
-    uploader = info.get('uploader', '').strip()
+    chosen_url, chosen_title = _escolher_candidato_diverso(candidatos, last_title, last_uploader)
+    if chosen_url:
+        _registrar_autoplay_recente(guild_id, chosen_url)
+        return chosen_url, chosen_title
+
+    title = last_title.strip()
+    uploader = (info.get('uploader', '') or '').strip()
     query = " ".join(part for part in (title, uploader) if part)
     if not query:
         return None, None
@@ -89,9 +169,12 @@ async def buscar_recomendacao_autoplay(guild_id):
 
         if result and 'entries' in result:
             for entry in result['entries']:
-                picked = pick_url(entry)
-                if picked:
-                    return picked
+                collect_candidate(entry)
+
+            chosen_url, chosen_title = _escolher_candidato_diverso(candidatos, last_title, last_uploader)
+            if chosen_url:
+                _registrar_autoplay_recente(guild_id, chosen_url)
+                return chosen_url, chosen_title
     except Exception as e:
         logging.warning(f"Falha ao buscar fallback de autoplay para guild {guild_id}: {e}")
 
@@ -248,6 +331,7 @@ class MusicCommands(commands.Cog):
             autoplay_enabled.pop(guild_id, None)
             last_played_info.pop(guild_id, None)
             active_preset.pop(guild_id, None)
+            autoplay_recent_urls.pop(guild_id, None)
             await ctx.guild.voice_client.disconnect()
             await ctx.send("Desconectado do canal de voz.")
         else:
