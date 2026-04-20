@@ -255,9 +255,9 @@ class MusicCommands(commands.Cog):
 
     @commands.command(name='preset')
     async def preset(self, ctx, mode: str = None):
-        """Controla o preset da equalização: padrao ou bassbost.
+        """Controla o preset da equalização: padrao, bassboost, pop ou rock.
 
-        Uso: !preset [padrao|bassbost|status]
+        Uso: !preset [padrao|bassboost|pop|rock|status]
         """
         if not validar_canal(ctx):
             await ctx.send("O Animal, Use o canal JUKEBOX para comandos de música.")
@@ -271,11 +271,8 @@ class MusicCommands(commands.Cog):
             return
 
         mode = mode.lower()
-        if mode == 'bassboost':
-            mode = 'bassbost'
-
-        if mode not in ('padrao', 'bassbost'):
-            await ctx.send("Uso inválido. Use `!preset padrao`, `!preset bassbost` ou `!preset status`.")
+        if mode not in ('padrao', 'bassboost', 'pop', 'rock'):
+            await ctx.send("Uso inválido. Use `!preset padrao`, `!preset bassboost`, `!preset pop`, `!preset rock` ou `!preset status`.")
             return
 
         if mode not in EQUALIZER_PRESETS:
