@@ -166,6 +166,21 @@ def _titulo_muito_parecido(title_a: str, title_b: str) -> bool:
     return jaccard >= 0.50
 
 
+def _parece_conteudo_nao_musical(title: str) -> bool:
+    """Tenta eliminar resultados de busca que claramente não são músicas."""
+    t = _normalizar_texto(title)
+    if not t:
+        return True
+
+    non_music_markers = (
+        "podcast", "interview", "entrevista", "aula", "lesson", "english",
+        "how to", "tutorial", "documentary", "documentario", "reaction",
+        "review", "news", "noticias", "analysis", "analise", "speech",
+        "debate", "live stream", "livestream", "audiobook"
+    )
+    return any(marker in t for marker in non_music_markers)
+
+
 def _uploader_entry(entry: dict) -> str:
     return _normalizar_texto(
         entry.get('uploader') or entry.get('channel') or entry.get('channel_name') or entry.get('artist')
@@ -395,6 +410,8 @@ async def buscar_recomendacao_autoplay(guild_id, ctx=None):
         title = (entry.get('title') or '').strip()
         if not title:
             return
+        if _parece_conteudo_nao_musical(title):
+            return
         uploader = _uploader_entry(entry)
 
         for key in ('url', 'webpage_url', 'original_url', 'id'):
@@ -427,7 +444,7 @@ async def buscar_recomendacao_autoplay(guild_id, ctx=None):
     uploader = (info.get('uploader', '') or '').strip()
     artist_clean = _limpar_nome_artista(uploader) or title.split('-')[0].strip()
 
-    async def buscar_por_query(query_text: str, max_results: int = 10):
+    async def buscar_por_query(query_text: str, max_results: int = 10, strict_diversity: bool = True):
         if not query_text:
             return None, None
 
@@ -448,6 +465,7 @@ async def buscar_recomendacao_autoplay(guild_id, ctx=None):
                 for entry in result['entries']:
                     collect_candidate(entry)
                 novos = len(candidatos) - antes
+                novos_candidatos = candidatos[antes:]
                 logging.info(f"[autoplay] Query '{query_text}': {len(result['entries'])} resultados do YT, {novos} novos candidatos (total: {len(candidatos)})")
 
                 selected_url, selected_title = _escolher_candidato_diverso(
@@ -463,6 +481,16 @@ async def buscar_recomendacao_autoplay(guild_id, ctx=None):
                     return selected_url, selected_title
                 else:
                     logging.info(f"[autoplay] Filtro de diversidade rejeitou todos os {len(candidatos)} candidatos para '{query_text}'")
+
+                # Modo relaxado (usado no bloco Last.fm): aceita o primeiro novo candidato
+                # que não seja equivalente ao título atual.
+                if not strict_diversity and novos_candidatos:
+                    for fallback_url, fallback_title, _fallback_uploader in novos_candidatos:
+                        if _titulo_equivalente(fallback_title, last_title):
+                            continue
+                        _registrar_autoplay_recente(guild_id, fallback_url)
+                        logging.info(f"[autoplay] Modo relaxado escolheu '{fallback_title}' para query '{query_text}'")
+                        return fallback_url, fallback_title
             else:
                 logging.info(f"[autoplay] Query '{query_text}': sem entries no resultado do YT")
         except Exception as e:
@@ -477,9 +505,9 @@ async def buscar_recomendacao_autoplay(guild_id, ctx=None):
         random.shuffle(similar_tracks)
         logging.info(f"[Last.fm] {len(similar_tracks)} faixas similares retornadas, testando as 10 primeiras")
         for sim_artist, sim_track in similar_tracks[:10]:
-            query = f"{sim_artist} {sim_track}"
+            query = f"{sim_artist} {sim_track} official audio"
             logging.info(f"[Last.fm] Buscando no YouTube: '{query}'")
-            chosen_url, chosen_title = await buscar_por_query(query, max_results=5)
+            chosen_url, chosen_title = await buscar_por_query(query, max_results=8, strict_diversity=False)
             if chosen_url:
                 logging.info(f"[Last.fm] Candidato aceito: '{chosen_title}' ({chosen_url})")
                 return chosen_url, chosen_title
