@@ -18,6 +18,11 @@ from .commands_utils import validar_canal, play_queue, last_played_info, autopla
 
 LASTFM_API_URL = "https://ws.audioscrobbler.com/2.0/"
 
+if LASTFM_API_KEY:
+    logging.info(f"[Last.fm] API key carregada com sucesso (primeiros 6 chars: {LASTFM_API_KEY[:6]}...)")
+else:
+    logging.warning("[Last.fm] LASTFM_API_KEY não configurada — recomendações via Last.fm desativadas.")
+
 MAX_AUTOPLAY_RECENTES = 20
 autoplay_recent_urls = {}
 recent_played_titles = {}
@@ -299,7 +304,9 @@ def _limpar_nome_artista(uploader: str) -> str:
 def _buscar_similar_lastfm(track_title: str, artist: str, limit: int = 20) -> list[tuple[str, str]]:
     """Chama Last.fm track.getSimilar e retorna lista de (artista, titulo)."""
     if not LASTFM_API_KEY or not track_title or not artist:
+        logging.warning(f"[Last.fm] Chamada ignorada — key={bool(LASTFM_API_KEY)}, title='{track_title}', artist='{artist}'")
         return []
+    logging.info(f"[Last.fm] Buscando similares para: '{track_title}' de '{artist}'")
     try:
         resp = requests.get(LASTFM_API_URL, params={
             'method': 'track.getSimilar',
@@ -318,9 +325,10 @@ def _buscar_similar_lastfm(track_title: str, artist: str, limit: int = 20) -> li
             t_artist = (t.get('artist', {}).get('name') or '').strip()
             if t_name and t_artist:
                 results.append((t_artist, t_name))
+        logging.info(f"[Last.fm] {len(results)} faixas similares encontradas para '{track_title}'")
         return results
     except Exception as e:
-        logging.warning(f"Falha ao buscar similares no Last.fm: {e}")
+        logging.warning(f"[Last.fm] Falha ao buscar similares: {e}")
         return []
 
 
@@ -457,6 +465,7 @@ async def buscar_recomendacao_autoplay(guild_id, ctx=None):
 
     # 1) Last.fm: músicas similares de verdade (artistas diferentes)
     if LASTFM_API_KEY:
+        logging.info(f"[Last.fm] Iniciando busca de similares para guild {guild_id} — title='{title}', artist='{artist_clean}'")
         similar_tracks = await asyncio.to_thread(_buscar_similar_lastfm, title, artist_clean)
         random.shuffle(similar_tracks)
         for sim_artist, sim_track in similar_tracks[:10]:
@@ -464,6 +473,7 @@ async def buscar_recomendacao_autoplay(guild_id, ctx=None):
             chosen_url, chosen_title = await buscar_por_query(query, max_results=5)
             if chosen_url:
                 return chosen_url, chosen_title
+        logging.warning(f"[Last.fm] Nenhum candidato válido encontrado via Last.fm para guild {guild_id}")
 
     # 2) Busca por outros títulos do mesmo artista (evita recomenda o mesmo título)
     uploader_only = _limpar_nome_artista(uploader) or _normalizar_texto(uploader)
