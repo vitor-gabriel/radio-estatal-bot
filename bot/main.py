@@ -3,7 +3,7 @@ import logging
 from datetime import datetime
 from discord.ext import commands
 
-from config.settings import DISCORD_TOKEN, REBOOT_CHANNEL_ID
+from config.settings import DISCORD_TOKEN, REBOOT_CHANNEL_ID, NOTIFICATION_CHANNEL_ID
 from db.database import db
 from bot.commands import MusicCommands, HelpCommands
 from bot.commands_monitor import MonitorCommands
@@ -41,6 +41,7 @@ bot = commands.Bot(
 
 # Criar instância do scheduler
 scheduler = MonitorScheduler(bot)
+_startup_notice_sent = False
 
 
 # --- INICIALIZAÇÃO DO BANCO DE DADOS ---
@@ -76,14 +77,38 @@ async def setup_cogs():
 @bot.event
 async def on_ready():
     """Evento disparado quando o bot está pronto e conectado"""
+    global _startup_notice_sent
     await setup_cogs()  # Registra os Cogs quando o bot iniciar
     logging.info(f"Bot conectado como {bot.user.name}")
 
     try:
-        # Reconectar ao canal de voz se o bot reiniciar
-        reboot_channel = bot.get_channel(REBOOT_CHANNEL_ID)
-        if reboot_channel:
-            await reboot_channel.send("🔄 Bot reiniciado e pronto para uso!")
+        if _startup_notice_sent:
+            return
+
+        # Prioriza canal de notificação do .env, com fallback para REBOOT_CHANNEL_ID.
+        channel_id = NOTIFICATION_CHANNEL_ID
+        if not channel_id and REBOOT_CHANNEL_ID:
+            try:
+                channel_id = int(REBOOT_CHANNEL_ID)
+            except (TypeError, ValueError):
+                channel_id = 0
+
+        if channel_id:
+            reboot_channel = bot.get_channel(channel_id)
+            if reboot_channel is None:
+                try:
+                    reboot_channel = await bot.fetch_channel(channel_id)
+                except Exception as e:
+                    logging.error(f"Erro ao localizar canal de notificação {channel_id}: {e}")
+                    reboot_channel = None
+
+            if reboot_channel:
+                await reboot_channel.send("✅ Servidor carregado. Bot pronto para reproduzir músicas!")
+                _startup_notice_sent = True
+            else:
+                logging.error(f"Canal de notificação {channel_id} não encontrado.")
+        else:
+            logging.warning("Nenhum canal de notificação configurado no .env.")
     except Exception as e:
         logging.error(f"Erro ao enviar mensagem de reboot: {e}")
 
