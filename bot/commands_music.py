@@ -5,6 +5,7 @@ import yt_dlp
 import asyncio
 import random
 import difflib
+import re
 from collections import deque
 
 from db.database import db
@@ -15,6 +16,10 @@ from .commands_utils import validar_canal, play_queue, last_played_info, autopla
 
 MAX_AUTOPLAY_RECENTES = 20
 autoplay_recent_urls = {}
+recent_played_titles = {}
+recent_played_uploaders = {}
+MAX_RECENT_TITLES = 12
+MAX_RECENT_UPLOADERS = 6
 
 
 def _normalizar_candidato_youtube(candidate):
@@ -47,6 +52,56 @@ def _normalizar_texto(value: str) -> str:
     return " ".join(str(value).lower().split())
 
 
+def _titulo_canonico(title: str) -> str:
+    """Normaliza variações comuns do mesmo vídeo/música para comparação."""
+    normalized = _normalizar_texto(title)
+    if not normalized:
+        return ""
+
+    normalized = re.sub(r"\[[^\]]*\]", " ", normalized)
+    normalized = re.sub(r"\([^)]*\)", " ", normalized)
+    noise_words = [
+        "official", "video", "audio", "lyrics", "lyric", "clipe", "clip", "live",
+        "legendado", "hd", "4k", "remastered", "version", "versao", "ptbr", "pt-br"
+    ]
+    for word in noise_words:
+        normalized = re.sub(rf"\b{re.escape(word)}\b", " ", normalized)
+
+    normalized = re.sub(r"[^a-z0-9\s]", " ", normalized)
+    normalized = " ".join(normalized.split())
+    return normalized
+
+
+def _token_set(title: str):
+    stopwords = {
+        "the", "a", "an", "of", "and", "in", "on", "feat", "ft", "with", "by", "official"
+    }
+    canonical = _titulo_canonico(title)
+    return {t for t in canonical.split() if t and t not in stopwords}
+
+
+def _titulo_equivalente(title_a: str, title_b: str) -> bool:
+    """Compara títulos por similaridade textual e interseção de tokens."""
+    a = _titulo_canonico(title_a)
+    b = _titulo_canonico(title_b)
+    if not a or not b:
+        return False
+
+    ratio = difflib.SequenceMatcher(None, a, b).ratio()
+    if ratio >= 0.72:
+        return True
+
+    ta = _token_set(a)
+    tb = _token_set(b)
+    if not ta or not tb:
+        return False
+
+    intersection = len(ta.intersection(tb))
+    union = len(ta.union(tb))
+    jaccard = (intersection / union) if union else 0
+    return jaccard >= 0.60
+
+
 def _titulo_muito_parecido(title_a: str, title_b: str) -> bool:
     """Detecta títulos muito parecidos para reduzir recomendações repetitivas."""
     a = _normalizar_texto(title_a)
@@ -74,7 +129,20 @@ def _registrar_autoplay_recente(guild_id: int, url: str):
     autoplay_recent_urls[guild_id].append(cleaned)
 
 
-def _escolher_candidato_diverso(candidatos, last_title: str, last_uploader: str):
+def _registrar_faixa_tocada(guild_id: int, title: str, uploader: str):
+    if guild_id not in recent_played_titles:
+        recent_played_titles[guild_id] = deque(maxlen=MAX_RECENT_TITLES)
+    if title:
+        recent_played_titles[guild_id].append(title)
+
+    if guild_id not in recent_played_uploaders:
+        recent_played_uploaders[guild_id] = deque(maxlen=MAX_RECENT_UPLOADERS)
+    uploader_normalized = _normalizar_texto(uploader)
+    if uploader_normalized:
+        recent_played_uploaders[guild_id].append(uploader_normalized)
+
+
+def _escolher_candidato_diverso(candidatos, guild_id: int, last_title: str, last_uploader: str):
     """Escolhe um candidato privilegiando diversidade de título e uploader."""
     if not candidatos:
         return None, None
@@ -83,13 +151,22 @@ def _escolher_candidato_diverso(candidatos, last_title: str, last_uploader: str)
     faixa_media = []
     faixa_fallback = []
 
+    history_titles = list(recent_played_titles.get(guild_id, []))
+    uploader_history = list(recent_played_uploaders.get(guild_id, []))
+    recent_uploader_window = set(uploader_history[-2:])
+
     for url, title, uploader in candidatos:
         same_uploader = bool(last_uploader and uploader and uploader == last_uploader)
         similar_title = _titulo_muito_parecido(last_title, title)
+        equivalent_recent_title = any(_titulo_equivalente(title, old_title) for old_title in history_titles)
+        recent_uploader = bool(uploader and uploader in recent_uploader_window)
 
-        if not same_uploader and not similar_title:
+        if equivalent_recent_title:
+            continue
+
+        if not same_uploader and not similar_title and not recent_uploader:
             faixa_diversa.append((url, title))
-        elif not similar_title:
+        elif not similar_title and not recent_uploader:
             faixa_media.append((url, title))
         else:
             faixa_fallback.append((url, title))
@@ -144,7 +221,7 @@ async def buscar_recomendacao_autoplay(guild_id):
         for video in related_videos:
             collect_candidate(video)
 
-    chosen_url, chosen_title = _escolher_candidato_diverso(candidatos, last_title, last_uploader)
+    chosen_url, chosen_title = _escolher_candidato_diverso(candidatos, guild_id, last_title, last_uploader)
     if chosen_url:
         _registrar_autoplay_recente(guild_id, chosen_url)
         return chosen_url, chosen_title
@@ -171,7 +248,7 @@ async def buscar_recomendacao_autoplay(guild_id):
             for entry in result['entries']:
                 collect_candidate(entry)
 
-            chosen_url, chosen_title = _escolher_candidato_diverso(candidatos, last_title, last_uploader)
+            chosen_url, chosen_title = _escolher_candidato_diverso(candidatos, guild_id, last_title, last_uploader)
             if chosen_url:
                 _registrar_autoplay_recente(guild_id, chosen_url)
                 return chosen_url, chosen_title
@@ -213,6 +290,11 @@ async def tocar_proxima_musica(vc, guild_id, ctx):
         track_info = info or {}
         track_info['requested_url'] = url
         last_played_info[guild_id] = track_info
+        _registrar_faixa_tocada(
+            guild_id,
+            stream_title,
+            (track_info.get('uploader') or track_info.get('channel') or track_info.get('artist') or '')
+        )
         try:
             vc.play(source, after=lambda e: asyncio.run_coroutine_threadsafe(
                 tocar_proxima_musica(vc, guild_id, ctx), ctx.bot.loop))
@@ -332,6 +414,8 @@ class MusicCommands(commands.Cog):
             last_played_info.pop(guild_id, None)
             active_preset.pop(guild_id, None)
             autoplay_recent_urls.pop(guild_id, None)
+            recent_played_titles.pop(guild_id, None)
+            recent_played_uploaders.pop(guild_id, None)
             await ctx.guild.voice_client.disconnect()
             await ctx.send("Desconectado do canal de voz.")
         else:
