@@ -776,17 +776,27 @@ async def _save_history(ctx, title: str, url: str, artist: str = "") -> bool:
             return False
 
         safe_artist = _sanitize_text(artist)
-        await db.create_user_profile(str(ctx.author.id), ctx.author.name)
-        ok = await db.add_to_music_history(
-            str(ctx.author.id),
-            {"title": safe_title, "url": safe_url, "artist": safe_artist or None},
-        )
-        if not ok:
+        created = await db.create_user_profile(str(ctx.author.id), ctx.author.name)
+        if not created:
+            logging.error(
+                f"[MongoDB] Não foi possível garantir perfil para user={ctx.author.id}"
+            )
+            return False
+
+        # Tenta 2 vezes em caso de falha transitória de escrita.
+        for attempt in range(1, 3):
+            ok = await db.add_to_music_history(
+                str(ctx.author.id),
+                {"title": safe_title, "url": safe_url, "artist": safe_artist or None},
+            )
+            if ok:
+                return True
             logging.warning(
-                f"[MongoDB] Falha ao registrar música — "
+                f"[MongoDB] Falha ao registrar música (tentativa {attempt}/2) — "
                 f"user={ctx.author.id}, title='{safe_title}', url='{safe_url}'"
             )
-        return ok
+
+        return False
     except Exception as exc:
         logging.error(f"[MongoDB] Erro ao salvar histórico musical: {exc}")
         return False
@@ -1091,8 +1101,27 @@ async def play_next(vc, guild_id: int, ctx) -> None:
 
     last_played_info[guild_id] = track_info
     uploader = track_info.get("uploader") or track_info.get("channel") or track_info.get("artist") or ""
+    saved = await _save_history(ctx, stream_title, url, uploader)
+    if not saved:
+        # Não toca se não conseguir persistir histórico; devolve à fila para retentar.
+        play_queue[guild_id].appendleft((url, preset_name))
+        try:
+            if hasattr(source, "cleanup"):
+                source.cleanup()
+        except Exception:
+            pass
+
+        logging.error(
+            "Reprodução bloqueada: falha ao gravar histórico no MongoDB "
+            f"(guild={guild_id}, user={ctx.author.id if getattr(ctx, 'author', None) else 'unknown'})"
+        )
+        await ctx.send(
+            "Nao foi possivel registrar o historico no MongoDB. "
+            "A reproducao foi bloqueada para evitar tocar sem gravar."
+        )
+        return
+
     _register_played_track(guild_id, stream_title, uploader)
-    await _save_history(ctx, stream_title, url, uploader)
 
     try:
         vc.play(
