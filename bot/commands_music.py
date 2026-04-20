@@ -71,6 +71,8 @@ autoplay_recent_urls: dict[int, deque] = {}
 recent_played_titles: dict[int, deque] = {}
 recent_played_uploaders: dict[int, deque] = {}
 manual_stop_guilds: set[int] = set()
+# Marca gravação já feita no !play para a próxima execução do play_next.
+presaved_next_url: dict[int, str] = {}
 
 # Cache de tags Last.fm por artista normalizado
 _lastfm_artist_tags_cache: dict[str, set[str]] = {}
@@ -1101,7 +1103,13 @@ async def play_next(vc, guild_id: int, ctx) -> None:
 
     last_played_info[guild_id] = track_info
     uploader = track_info.get("uploader") or track_info.get("channel") or track_info.get("artist") or ""
-    saved = await _save_history(ctx, stream_title, url, uploader)
+    current_url = _normalize_youtube_url(url) or str(url).strip()
+    already_saved = presaved_next_url.get(guild_id) == current_url
+    if already_saved:
+        presaved_next_url.pop(guild_id, None)
+        saved = True
+    else:
+        saved = await _save_history(ctx, stream_title, url, uploader)
     if not saved:
         # Não toca se não conseguir persistir histórico; devolve à fila para retentar.
         play_queue[guild_id].appendleft((url, preset_name))
@@ -1170,6 +1178,7 @@ class MusicCommands(commands.Cog):
         autoplay_recent_urls.pop(guild_id, None)
         recent_played_titles.pop(guild_id, None)
         recent_played_uploaders.pop(guild_id, None)
+        presaved_next_url.pop(guild_id, None)
         manual_stop_guilds.discard(guild_id)
 
     # ------------------------------------------------------------------
@@ -1238,6 +1247,7 @@ class MusicCommands(commands.Cog):
             if not artist_clean and "-" in selected_title:
                 artist_clean = _clean_artist_name(selected_title.split("-", 1)[0].strip())
 
+            was_queue_empty = not play_queue[guild_id]
             play_queue[guild_id].append((selected_url, preset_name))
 
             # ----------------------------------------------------------
@@ -1317,6 +1327,21 @@ class MusicCommands(commands.Cog):
                     f"Resultado da busca: **{selected_title}**\n"
                     f"Adicionado à fila com preset `{preset_name}`"
                 )
+
+            if was_queue_empty and not vc.is_playing() and not vc.is_paused():
+                # Exigência: garantir tentativa de gravação já no fluxo do !play.
+                pre_saved = await _save_history(ctx, selected_title, selected_url, selected_artist)
+                if not pre_saved:
+                    # Remove a música recém-adicionada para não tocar sem gravar.
+                    if play_queue[guild_id] and play_queue[guild_id][-1][0] == selected_url:
+                        play_queue[guild_id].pop()
+                    await ctx.send(
+                        "Nao foi possivel registrar o historico no MongoDB. "
+                        "A reproducao foi bloqueada para evitar tocar sem gravar."
+                    )
+                    return
+
+                presaved_next_url[guild_id] = _normalize_youtube_url(selected_url) or selected_url
 
             if not vc.is_playing() and not vc.is_paused():
                 await play_next(vc, guild_id, ctx)
