@@ -143,7 +143,14 @@ def _registrar_faixa_tocada(guild_id: int, title: str, uploader: str):
         recent_played_uploaders[guild_id].append(uploader_normalized)
 
 
-def _escolher_candidato_diverso(candidatos, guild_id: int, last_title: str, last_uploader: str):
+def _escolher_candidato_diverso(
+    candidatos,
+    guild_id: int,
+    last_title: str,
+    last_uploader: str,
+    extra_titles=None,
+    extra_uploaders=None,
+):
     """Escolhe um candidato privilegiando diversidade de título e uploader."""
     if not candidatos:
         return None, None
@@ -154,6 +161,11 @@ def _escolher_candidato_diverso(candidatos, guild_id: int, last_title: str, last
 
     history_titles = list(recent_played_titles.get(guild_id, []))
     uploader_history = list(recent_played_uploaders.get(guild_id, []))
+    if extra_titles:
+        history_titles.extend(extra_titles)
+    if extra_uploaders:
+        uploader_history.extend(_normalizar_texto(u) for u in extra_uploaders if u)
+
     recent_uploader_window = set(uploader_history[-2:])
 
     for url, title, uploader in candidatos:
@@ -179,15 +191,49 @@ def _escolher_candidato_diverso(candidatos, guild_id: int, last_title: str, last
     return None, None
 
 
-async def buscar_recomendacao_autoplay(guild_id):
+async def buscar_recomendacao_autoplay(guild_id, ctx=None):
     """Busca uma URL recomendada para autoplay com fallback por pesquisa."""
     info = last_played_info.get(guild_id) or {}
     queue_urls = set(autoplay_recent_urls.get(guild_id, []))
     candidatos = []
     seen_candidates = set()
+    mongo_titles = []
+    mongo_uploaders = []
+    mongo_artist_hints = []
 
     last_title = info.get('title', '')
     last_uploader = _normalizar_texto(info.get('uploader') or info.get('channel') or info.get('artist'))
+
+    # Usa histórico persistido no MongoDB como referência adicional para evitar repetições.
+    try:
+        if ctx and getattr(ctx, 'author', None):
+            user_profile = await db.get_user_profile(str(ctx.author.id))
+            if user_profile and user_profile.music_history:
+                recent_db_songs = user_profile.music_history[-20:]
+                for song in recent_db_songs:
+                    song_title = getattr(song, 'title', '') or ''
+                    song_url = getattr(song, 'url', None)
+                    song_artist = getattr(song, 'artist', None)
+
+                    if song_title:
+                        mongo_titles.append(song_title)
+                    if song_artist:
+                        mongo_uploaders.append(song_artist)
+
+                    if song_url:
+                        normalized_song_url = _normalizar_candidato_youtube(song_url)
+                        if normalized_song_url:
+                            queue_urls.add(normalized_song_url)
+
+                # Dicas de artistas recentes para fallback de busca.
+                for song in reversed(recent_db_songs):
+                    artist = (getattr(song, 'artist', None) or '').strip()
+                    if artist and artist.lower() not in {a.lower() for a in mongo_artist_hints}:
+                        mongo_artist_hints.append(artist)
+                    if len(mongo_artist_hints) >= 3:
+                        break
+    except Exception as e:
+        logging.warning(f"Falha ao carregar histórico MongoDB para autoplay na guild {guild_id}: {e}")
 
     for entry in play_queue.get(guild_id, []):
         try:
@@ -222,39 +268,81 @@ async def buscar_recomendacao_autoplay(guild_id):
         for video in related_videos:
             collect_candidate(video)
 
-    chosen_url, chosen_title = _escolher_candidato_diverso(candidatos, guild_id, last_title, last_uploader)
+    chosen_url, chosen_title = _escolher_candidato_diverso(
+        candidatos,
+        guild_id,
+        last_title,
+        last_uploader,
+        extra_titles=mongo_titles,
+        extra_uploaders=mongo_uploaders,
+    )
     if chosen_url:
         _registrar_autoplay_recente(guild_id, chosen_url)
         return chosen_url, chosen_title
 
     title = last_title.strip()
     uploader = (info.get('uploader', '') or '').strip()
-    query = " ".join(part for part in (title, uploader) if part)
-    if not query:
+
+    async def buscar_por_query(query_text: str, max_results: int = 10):
+        if not query_text:
+            return None, None
+
+        try:
+            with yt_dlp.YoutubeDL({
+                'quiet': True,
+                'extract_flat': True,
+                'default_search': f'ytsearch{max_results}'
+            }) as ydl:
+                result = await asyncio.to_thread(
+                    ydl.extract_info,
+                    f"ytsearch{max_results}:{query_text.replace('&', 'and')}",
+                    download=False
+                )
+
+            if result and 'entries' in result:
+                for entry in result['entries']:
+                    collect_candidate(entry)
+
+                selected_url, selected_title = _escolher_candidato_diverso(
+                    candidatos,
+                    guild_id,
+                    last_title,
+                    last_uploader,
+                    extra_titles=mongo_titles,
+                    extra_uploaders=mongo_uploaders,
+                )
+                if selected_url:
+                    _registrar_autoplay_recente(guild_id, selected_url)
+                    return selected_url, selected_title
+        except Exception as e:
+            logging.warning(f"Falha ao buscar autoplay com query '{query_text}' para guild {guild_id}: {e}")
+
         return None, None
 
-    try:
-        with yt_dlp.YoutubeDL({
-            'quiet': True,
-            'extract_flat': True,
-            'default_search': 'ytsearch10'
-        }) as ydl:
-            result = await asyncio.to_thread(
-                ydl.extract_info,
-                f"ytsearch10:{query.replace('&', 'and')}",
-                download=False
-            )
+    # 1) Busca principal: título + uploader
+    main_query = " ".join(part for part in (title, uploader) if part)
+    chosen_url, chosen_title = await buscar_por_query(main_query, max_results=10)
+    if chosen_url:
+        return chosen_url, chosen_title
 
-        if result and 'entries' in result:
-            for entry in result['entries']:
-                collect_candidate(entry)
+    # 2) Fallback: apenas uploader/canal para aumentar variedade de faixas
+    uploader_only = _normalizar_texto(uploader)
+    chosen_url, chosen_title = await buscar_por_query(uploader_only, max_results=20)
+    if chosen_url:
+        return chosen_url, chosen_title
 
-            chosen_url, chosen_title = _escolher_candidato_diverso(candidatos, guild_id, last_title, last_uploader)
-            if chosen_url:
-                _registrar_autoplay_recente(guild_id, chosen_url)
-                return chosen_url, chosen_title
-    except Exception as e:
-        logging.warning(f"Falha ao buscar fallback de autoplay para guild {guild_id}: {e}")
+    # 2.5) Fallback adicional: artistas recentes do MongoDB
+    for artist_hint in mongo_artist_hints:
+        chosen_url, chosen_title = await buscar_por_query(f"{artist_hint} official", max_results=20)
+        if chosen_url:
+            return chosen_url, chosen_title
+
+    # 3) Fallback extra: parte antes de '-' (muitas vezes artista) + "official"
+    artista_hint = title.split('-')[0].strip() if '-' in title else ""
+    extra_query = f"{artista_hint} official".strip()
+    chosen_url, chosen_title = await buscar_por_query(extra_query, max_results=25)
+    if chosen_url:
+        return chosen_url, chosen_title
 
     return None, None
 
@@ -270,7 +358,7 @@ async def tocar_proxima_musica(vc, guild_id, ctx):
 
     if not play_queue[guild_id]:
         if autoplay_enabled.get(guild_id, False):
-            next_url, next_title = await buscar_recomendacao_autoplay(guild_id)
+            next_url, next_title = await buscar_recomendacao_autoplay(guild_id, ctx)
             if next_url:
                 logging.info(f"Fila vazia. Adicionando música recomendada: {next_url}")
                 preset_name = active_preset.get(guild_id, 'padrao')
@@ -280,8 +368,10 @@ async def tocar_proxima_musica(vc, guild_id, ctx):
                 else:
                     await ctx.send("Fila vazia. Reproduzindo uma música recomendada.")
             else:
-                await ctx.send("A fila de músicas está vazia e não há recomendações para o auto-play. A reprodução parou.")
-                await vc.disconnect()
+                await ctx.send(
+                    "Auto-play não encontrou recomendação no momento. Vou permanecer no canal; "
+                    "tente `!skip` novamente ou use `!play <url>`."
+                )
                 return
         else:
             await ctx.send("A fila de músicas está vazia. Desconectando do canal de voz.")
