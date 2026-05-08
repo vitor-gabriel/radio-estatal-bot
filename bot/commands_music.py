@@ -368,11 +368,11 @@ async def _search_ytdlp(query: str, max_results: int) -> list[dict]:
         opts = {
             'js_runtimes': {
                 'node': { 
-                    'path': None 
+                    'path': r'C:\Program Files\nodejs\node.exe' 
                 }
             },
             "quiet": True,
-            "extract_flat": True,
+            "extract_flat": False,
             'format': 'bestaudio/best',
             "default_search": "ytsearch" 
         }
