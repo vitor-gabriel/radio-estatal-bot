@@ -359,10 +359,7 @@ async def _search_yt_music_api(query: str, max_results: int) -> list[dict]:
 
 async def _search_ytdlp(query: str, max_results: int) -> list[dict]:
     """Busca via yt_dlp: tenta endpoint do YT Music"""
-    encoded = urllib.parse.quote_plus(query)
-    ytm_url = f"https://music.youtube.com/search?q={encoded}"
 
-    # Tentativa 1: ytsearch
     safe_query = query.replace("&", "and")
     try:
         opts = {
