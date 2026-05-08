@@ -1356,7 +1356,6 @@ class MusicCommands(commands.Cog):
     # ------------------------------------------------------------------
 
     @commands.command(name="stop")
-    @commands.command(name="stop")
     async def stop(self, ctx):
         """Para a reprodução atual e limpa a fila."""
         vc = ctx.guild.voice_client
