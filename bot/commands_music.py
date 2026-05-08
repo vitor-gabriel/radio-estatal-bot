@@ -358,26 +358,23 @@ async def _search_yt_music_api(query: str, max_results: int) -> list[dict]:
 
 
 async def _search_ytdlp(query: str, max_results: int) -> list[dict]:
-    """Busca via yt_dlp: tenta endpoint do YT Music, depois fallback ytsearch."""
+    """Busca via yt_dlp: tenta endpoint do YT Music"""
     encoded = urllib.parse.quote_plus(query)
     ytm_url = f"https://music.youtube.com/search?q={encoded}"
 
-    # Tentativa 1: endpoint do YouTube Music
-    try:
-        with yt_dlp.YoutubeDL({"quiet": True, "extract_flat": True}) as ydl:
-            result = await asyncio.to_thread(ydl.extract_info, ytm_url, download=False)
-        if result and isinstance(result, dict) and result.get("entries"):
-            return [e for e in result["entries"] if e]
-    except Exception as exc:
-        logging.info(f"Busca no YT Music falhou para '{query}': {exc}")
-
-    # Tentativa 2: ytsearch
+    # Tentativa 1: ytsearch
     safe_query = query.replace("&", "and")
     try:
         opts = {
+            'js_runtimes': {
+                'node': { 
+                    'path': None 
+                }
+            },
             "quiet": True,
             "extract_flat": True,
-            "default_search": f"ytsearch{max_results}",
+            'format': 'bestaudio/best',
+            "default_search": "ytsearch" 
         }
         with yt_dlp.YoutubeDL(opts) as ydl:
             result = await asyncio.to_thread(
