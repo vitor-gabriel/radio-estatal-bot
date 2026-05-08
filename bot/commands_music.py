@@ -71,8 +71,6 @@ autoplay_recent_urls: dict[int, deque] = {}
 recent_played_titles: dict[int, deque] = {}
 recent_played_uploaders: dict[int, deque] = {}
 manual_stop_guilds: set[int] = set()
-# Marca gravação já feita no !play para a próxima execução do play_next.
-presaved_next_url: dict[int, str] = {}
 
 # Cache de tags Last.fm por artista normalizado
 _lastfm_artist_tags_cache: dict[str, set[str]] = {}
@@ -778,27 +776,17 @@ async def _save_history(ctx, title: str, url: str, artist: str = "") -> bool:
             return False
 
         safe_artist = _sanitize_text(artist)
-        created = await db.create_user_profile(str(ctx.author.id), ctx.author.name)
-        if not created:
-            logging.error(
-                f"[MongoDB] Não foi possível garantir perfil para user={ctx.author.id}"
-            )
-            return False
-
-        # Tenta 2 vezes em caso de falha transitória de escrita.
-        for attempt in range(1, 3):
-            ok = await db.add_to_music_history(
-                str(ctx.author.id),
-                {"title": safe_title, "url": safe_url, "artist": safe_artist or None},
-            )
-            if ok:
-                return True
+        await db.create_user_profile(str(ctx.author.id), ctx.author.name)
+        ok = await db.add_to_music_history(
+            str(ctx.author.id),
+            {"title": safe_title, "url": safe_url, "artist": safe_artist or None},
+        )
+        if not ok:
             logging.warning(
-                f"[MongoDB] Falha ao registrar música (tentativa {attempt}/2) — "
+                f"[MongoDB] Falha ao registrar música — "
                 f"user={ctx.author.id}, title='{safe_title}', url='{safe_url}'"
             )
-
-        return False
+        return ok
     except Exception as exc:
         logging.error(f"[MongoDB] Erro ao salvar histórico musical: {exc}")
         return False
@@ -1054,14 +1042,41 @@ async def find_autoplay_recommendation(
 # ===========================================================================
 
 
+def _vc_is_usable(vc) -> bool:
+    """Retorna True somente se o VoiceClient existe e está conectado ao canal."""
+    return vc is not None and getattr(vc, "is_connected", lambda: False)()
+
+
 async def play_next(vc, guild_id: int, ctx) -> None:
     """Toca a próxima música da fila ou busca uma via autoplay se a fila estiver vazia."""
+
+    # ------------------------------------------------------------------ #
+    # Guarda 1: parada manual solicitada via !stop                        #
+    # ------------------------------------------------------------------ #
     if guild_id in manual_stop_guilds:
         manual_stop_guilds.discard(guild_id)
+        logging.info(f"[play_next] guild={guild_id} — parada manual detectada, abortando.")
         return
+
+    # ------------------------------------------------------------------ #
+    # Guarda 2: VoiceClient desconectado (ex.: !leave, kick, queda de    #
+    # rede). O callback after= pode disparar mesmo após a desconexão.    #
+    # ------------------------------------------------------------------ #
+    if not _vc_is_usable(vc):
+        guild = getattr(ctx, "guild", None)
+        live_vc = guild.voice_client if guild else None
+        if _vc_is_usable(live_vc):
+            vc = live_vc
+        else:
+            logging.info(f"[play_next] guild={guild_id} — VoiceClient desconectado, abortando.")
+            play_queue.pop(guild_id, None)
+            return
 
     play_queue.setdefault(guild_id, deque())
 
+    # ------------------------------------------------------------------ #
+    # Fila vazia: autoplay ou desconexão                                  #
+    # ------------------------------------------------------------------ #
     if not play_queue[guild_id]:
         if not autoplay_enabled.get(guild_id, True):
             await ctx.send("A fila de músicas está vazia. Desconectando do canal de voz.")
@@ -1076,10 +1091,19 @@ async def play_next(vc, guild_id: int, ctx) -> None:
             )
             return
 
+        # Verifica novamente: o bot pode ter sido desconectado enquanto
+        # a busca assíncrona estava em andamento.
+        if not _vc_is_usable(vc):
+            logging.info(f"[play_next] guild={guild_id} — vc desconectou durante busca de autoplay.")
+            return
+
         preset = active_preset.get(guild_id, "padrao")
         play_queue[guild_id].append((next_url, preset))
-        msg = f"Fila vazia. Auto-play escolheu: **{next_title}**" if next_title else \
-              "Fila vazia. Reproduzindo uma música recomendada."
+        msg = (
+            f"Fila vazia. Auto-play escolheu: **{next_title}**"
+            if next_title
+            else "Fila vazia. Reproduzindo uma música recomendada."
+        )
         await ctx.send(msg)
 
     url, preset_name = play_queue[guild_id].popleft()
@@ -1102,47 +1126,41 @@ async def play_next(vc, guild_id: int, ctx) -> None:
         track_info["related_videos"] = prev["related_videos"]
 
     last_played_info[guild_id] = track_info
-    uploader = track_info.get("uploader") or track_info.get("channel") or track_info.get("artist") or ""
-    current_url = _normalize_youtube_url(url) or str(url).strip()
-    already_saved = presaved_next_url.get(guild_id) == current_url
-    if already_saved:
-        presaved_next_url.pop(guild_id, None)
-        saved = True
-    else:
-        saved = await _save_history(ctx, stream_title, url, uploader)
-    if not saved:
-        # Não toca se não conseguir persistir histórico; devolve à fila para retentar.
-        play_queue[guild_id].appendleft((url, preset_name))
-        try:
-            if hasattr(source, "cleanup"):
-                source.cleanup()
-        except Exception:
-            pass
+    uploader = (
+        track_info.get("uploader")
+        or track_info.get("channel")
+        or track_info.get("artist")
+        or ""
+    )
+    _register_played_track(guild_id, stream_title, uploader)
+    await _save_history(ctx, stream_title, url, uploader)
 
-        logging.error(
-            "Reprodução bloqueada: falha ao gravar histórico no MongoDB "
-            f"(guild={guild_id}, user={ctx.author.id if getattr(ctx, 'author', None) else 'unknown'})"
-        )
-        await ctx.send(
-            "Nao foi possivel registrar o historico no MongoDB. "
-            "A reproducao foi bloqueada para evitar tocar sem gravar."
-        )
+    # ------------------------------------------------------------------ #
+    # Guarda 3: checa conexão antes de chamar vc.play()                  #
+    # ------------------------------------------------------------------ #
+    if not _vc_is_usable(vc):
+        logging.info(f"[play_next] guild={guild_id} — vc desconectou antes de play(), abortando.")
         return
 
-    _register_played_track(guild_id, stream_title, uploader)
+    def _after_play(error):
+        if error:
+            logging.error(f"[after_play] guild={guild_id} — erro durante reprodução: {error}")
+        # Não avança se parada manual ou vc desconectado.
+        if guild_id in manual_stop_guilds:
+            return
+        if not _vc_is_usable(vc):
+            logging.info(f"[after_play] guild={guild_id} — vc desconectado ao finalizar faixa.")
+            return
+        asyncio.run_coroutine_threadsafe(play_next(vc, guild_id, ctx), ctx.bot.loop)
 
     try:
-        vc.play(
-            source,
-            after=lambda _: asyncio.run_coroutine_threadsafe(
-                play_next(vc, guild_id, ctx), ctx.bot.loop
-            ),
-        )
+        vc.play(source, after=_after_play)
         await ctx.send(f"Transmitindo agora: **{stream_title}** com preset `{preset_name}`")
     except Exception as exc:
         logging.error(f"Erro ao transmitir `{stream_title}`: {exc}")
         await ctx.send(f"Erro ao transmitir `{stream_title}`: {exc}")
-        await play_next(vc, guild_id, ctx)
+        if _vc_is_usable(vc):
+            await play_next(vc, guild_id, ctx)
 
 
 # ===========================================================================
@@ -1178,7 +1196,6 @@ class MusicCommands(commands.Cog):
         autoplay_recent_urls.pop(guild_id, None)
         recent_played_titles.pop(guild_id, None)
         recent_played_uploaders.pop(guild_id, None)
-        presaved_next_url.pop(guild_id, None)
         manual_stop_guilds.discard(guild_id)
 
     # ------------------------------------------------------------------
@@ -1247,7 +1264,6 @@ class MusicCommands(commands.Cog):
             if not artist_clean and "-" in selected_title:
                 artist_clean = _clean_artist_name(selected_title.split("-", 1)[0].strip())
 
-            was_queue_empty = not play_queue[guild_id]
             play_queue[guild_id].append((selected_url, preset_name))
 
             # ----------------------------------------------------------
@@ -1328,21 +1344,6 @@ class MusicCommands(commands.Cog):
                     f"Adicionado à fila com preset `{preset_name}`"
                 )
 
-            if was_queue_empty and not vc.is_playing() and not vc.is_paused():
-                # Exigência: garantir tentativa de gravação já no fluxo do !play.
-                pre_saved = await _save_history(ctx, selected_title, selected_url, selected_artist)
-                if not pre_saved:
-                    # Remove a música recém-adicionada para não tocar sem gravar.
-                    if play_queue[guild_id] and play_queue[guild_id][-1][0] == selected_url:
-                        play_queue[guild_id].pop()
-                    await ctx.send(
-                        "Nao foi possivel registrar o historico no MongoDB. "
-                        "A reproducao foi bloqueada para evitar tocar sem gravar."
-                    )
-                    return
-
-                presaved_next_url[guild_id] = _normalize_youtube_url(selected_url) or selected_url
-
             if not vc.is_playing() and not vc.is_paused():
                 await play_next(vc, guild_id, ctx)
 
@@ -1355,11 +1356,14 @@ class MusicCommands(commands.Cog):
     # ------------------------------------------------------------------
 
     @commands.command(name="stop")
+    @commands.command(name="stop")
     async def stop(self, ctx):
-        """Para a reprodução atual."""
+        """Para a reprodução atual e limpa a fila."""
         vc = ctx.guild.voice_client
-        if vc and vc.is_playing():
+        if vc and (vc.is_playing() or vc.is_paused()):
             guild_id = ctx.guild.id
+            # Registra ANTES de vc.stop() para que o callback after=
+            # veja o flag e não avance para a próxima faixa.
             manual_stop_guilds.add(guild_id)
             play_queue.get(guild_id, deque()).clear()
             vc.stop()
